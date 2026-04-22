@@ -31,6 +31,7 @@ const (
 	replayStateFailed    = "failed"
 	defaultWebhookHeader = "X-Webhook-Secret"
 	defaultReplaysDir    = "./parsed"
+	defaultStateFileName = "replay_state.json"
 	maxWebhookBodyBytes  = 1 << 20
 )
 
@@ -94,10 +95,19 @@ type replayService struct {
 	seenEvents        map[string]struct{}
 	queue             chan replayWork
 	replaysDir        string
+	stateFile         string
+	persistMu         sync.Mutex
 	webhookHeaderName string
 	webhookHeaderVal  string
 	adminToken        string
 	httpClient        *http.Client
+}
+
+type replayPersistentState struct {
+	Version          int                     `json:"version"`
+	Records          map[string]replayRecord `json:"records"`
+	LatestMapByMatch map[string]string       `json:"latest_map_by_match"`
+	SeenEvents       []string                `json:"seen_events"`
 }
 
 func newReplayService() (*replayService, error) {
@@ -115,6 +125,10 @@ func newReplayService() (*replayService, error) {
 	}
 
 	queueSize := envInt("QUEUE_SIZE", 1024)
+	stateFile := strings.TrimSpace(os.Getenv("REPLAY_STATE_FILE"))
+	if stateFile == "" {
+		stateFile = filepath.Join(replaysDir, defaultStateFileName)
+	}
 
 	svc := &replayService{
 		records:           map[string]*replayRecord{},
@@ -122,6 +136,7 @@ func newReplayService() (*replayService, error) {
 		seenEvents:        map[string]struct{}{},
 		queue:             make(chan replayWork, queueSize),
 		replaysDir:        replaysDir,
+		stateFile:         stateFile,
 		webhookHeaderName: headerName,
 		webhookHeaderVal:  os.Getenv("WEBHOOK_HEADER_VALUE"),
 		adminToken:        os.Getenv("ADMIN_REPROCESS_TOKEN"),
@@ -131,6 +146,9 @@ func newReplayService() (*replayService, error) {
 				return errors.New("redirects not allowed")
 			},
 		},
+	}
+	if err := svc.loadState(); err != nil {
+		return nil, err
 	}
 	return svc, nil
 }
@@ -146,6 +164,113 @@ func (s *replayService) startWorkers(n int) {
 	for i := 0; i < n; i++ {
 		go s.workerLoop(i + 1)
 	}
+	go s.recoverPendingJobs()
+}
+
+func (s *replayService) recoverPendingJobs() {
+	now := time.Now().UTC()
+	jobs := make([]replayWork, 0)
+
+	s.mu.Lock()
+	for _, rec := range s.records {
+		if rec.State == replayStateParsing {
+			rec.State = replayStateQueued
+			rec.LastError = ""
+			rec.LastUpdatedAt = now
+		}
+		if rec.State == replayStateQueued && strings.TrimSpace(rec.DemoURL) != "" {
+			jobs = append(jobs, replayWork{
+				EventID:         rec.LastEventID,
+				MatchID:         rec.MatchID,
+				MapID:           rec.MapID,
+				MatchInstanceID: rec.MatchInstanceID,
+				DemoURL:         rec.DemoURL,
+				Timestamp:       rec.LastWebhookEventAt,
+			})
+		}
+	}
+	s.mu.Unlock()
+
+	if len(jobs) == 0 {
+		return
+	}
+	if err := s.persistState(); err != nil {
+		logger.Error("failed to persist replay state during startup recovery", zap.Error(err))
+	}
+
+	for _, job := range jobs {
+		s.queue <- job
+	}
+
+	logger.Info("recovered replay jobs from persisted state", zap.Int("jobs", len(jobs)))
+}
+
+func (s *replayService) loadState() error {
+	data, err := os.ReadFile(s.stateFile)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+
+	var persisted replayPersistentState
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		return err
+	}
+
+	records := map[string]*replayRecord{}
+	for key, rec := range persisted.Records {
+		recCopy := rec
+		records[key] = &recCopy
+	}
+
+	latest := persisted.LatestMapByMatch
+	if latest == nil {
+		latest = map[string]string{}
+	}
+
+	seen := map[string]struct{}{}
+	for _, key := range persisted.SeenEvents {
+		if strings.TrimSpace(key) == "" {
+			continue
+		}
+		seen[key] = struct{}{}
+	}
+
+	s.mu.Lock()
+	s.records = records
+	s.latestMapByMatch = latest
+	s.seenEvents = seen
+	s.mu.Unlock()
+
+	logger.Info("loaded replay state", zap.Int("records", len(records)), zap.Int("seen_events", len(seen)))
+	return nil
+}
+
+func (s *replayService) persistState() error {
+	s.mu.RLock()
+	persisted := replayPersistentState{
+		Version:          1,
+		Records:          make(map[string]replayRecord, len(s.records)),
+		LatestMapByMatch: make(map[string]string, len(s.latestMapByMatch)),
+		SeenEvents:       make([]string, 0, len(s.seenEvents)),
+	}
+	for key, rec := range s.records {
+		persisted.Records[key] = *rec
+	}
+	for key, value := range s.latestMapByMatch {
+		persisted.LatestMapByMatch[key] = value
+	}
+	for key := range s.seenEvents {
+		persisted.SeenEvents = append(persisted.SeenEvents, key)
+	}
+	s.mu.RUnlock()
+
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
+
+	return writeJSONFileAtomic(s.stateFile, persisted)
 }
 
 func (s *replayService) workerLoop(id int) {
@@ -313,7 +438,6 @@ func (s *replayService) process(job replayWork) error {
 func (s *replayService) updateState(matchID string, mapID string, state string, artifactPath string, lastError string, demoURL string, eventID string) {
 	now := time.Now().UTC()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	rec := s.getOrCreateLocked(matchID, mapID)
 	rec.MapID = mapID
@@ -334,6 +458,11 @@ func (s *replayService) updateState(matchID string, mapID string, state string, 
 		rec.LastEventID = eventID
 	}
 	s.latestMapByMatch[matchID] = mapID
+	s.mu.Unlock()
+
+	if err := s.persistState(); err != nil {
+		logger.Error("failed to persist replay state", zap.Error(err))
+	}
 }
 
 func replayRecordKey(matchID string, mapID string) string {
@@ -424,6 +553,7 @@ func (s *replayService) webhookDemoReadyHandler(w http.ResponseWriter, r *http.R
 		mapID = "unknown"
 	}
 	dedupeKey := eventDedupeKey(event.EventID, event.Payload.ID, mapID)
+	now := time.Now().UTC()
 
 	s.mu.Lock()
 	if _, exists := s.seenEvents[dedupeKey]; exists {
@@ -442,7 +572,6 @@ func (s *replayService) webhookDemoReadyHandler(w http.ResponseWriter, r *http.R
 		writeJSON(w, http.StatusAccepted, resp)
 		return
 	}
-	s.seenEvents[dedupeKey] = struct{}{}
 	rec := s.getOrCreateLocked(event.Payload.ID, mapID)
 	rec.MatchID = event.Payload.ID
 	rec.MapID = mapID
@@ -451,10 +580,23 @@ func (s *replayService) webhookDemoReadyHandler(w http.ResponseWriter, r *http.R
 	rec.LastWebhookEventAt = timestamp
 	rec.DemoURL = event.Payload.DemoURL
 	rec.LastEventID = event.EventID
-	rec.LastError = ""
-	rec.MapID = mapID
-	rec.State = replayStateQueued
-	rec.LastUpdatedAt = time.Now().UTC()
+	rec.LastUpdatedAt = now
+	if rec.State == replayStateQueued || rec.State == replayStateParsing {
+		rec.LastError = ""
+		s.latestMapByMatch[event.Payload.ID] = mapID
+		s.seenEvents[dedupeKey] = struct{}{}
+		state := rec.State
+		s.mu.Unlock()
+		if err := s.persistState(); err != nil {
+			logger.Error("failed to persist replay state", zap.Error(err))
+		}
+		writeJSON(w, http.StatusAccepted, map[string]string{
+			"match_id": event.Payload.ID,
+			"map_id":   mapID,
+			"state":    state,
+		})
+		return
+	}
 	s.mu.Unlock()
 
 	job := replayWork{
@@ -468,12 +610,45 @@ func (s *replayService) webhookDemoReadyHandler(w http.ResponseWriter, r *http.R
 
 	select {
 	case s.queue <- job:
+		s.mu.Lock()
+		rec := s.getOrCreateLocked(event.Payload.ID, mapID)
+		rec.MatchID = event.Payload.ID
+		rec.MapID = mapID
+		rec.MatchInstanceID = event.Payload.MatchInstanceID
+		rec.LastTransactionID = event.TransactionID
+		rec.LastWebhookEventAt = timestamp
+		rec.DemoURL = event.Payload.DemoURL
+		rec.LastEventID = event.EventID
+		rec.LastError = ""
+		rec.State = replayStateQueued
+		rec.LastUpdatedAt = now
+		s.latestMapByMatch[event.Payload.ID] = mapID
+		s.seenEvents[dedupeKey] = struct{}{}
+		s.mu.Unlock()
+		if err := s.persistState(); err != nil {
+			logger.Error("failed to persist replay state", zap.Error(err))
+		}
 		writeJSON(w, http.StatusAccepted, map[string]string{
 			"match_id": event.Payload.ID,
 			"map_id":   mapID,
 			"state":    replayStateQueued,
 		})
 	default:
+		s.mu.RLock()
+		rec, ok := s.getLocked(event.Payload.ID, mapID)
+		state := replayStateMissing
+		if ok {
+			state = rec.State
+		}
+		s.mu.RUnlock()
+		if state == replayStateQueued || state == replayStateParsing {
+			writeJSON(w, http.StatusAccepted, map[string]string{
+				"match_id": event.Payload.ID,
+				"map_id":   mapID,
+				"state":    state,
+			})
+			return
+		}
 		s.updateState(event.Payload.ID, mapID, replayStateFailed, "", "queue full", event.Payload.DemoURL, event.EventID)
 		http.Error(w, "ingest queue is full", http.StatusServiceUnavailable)
 	}

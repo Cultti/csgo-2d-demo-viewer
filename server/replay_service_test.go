@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -189,6 +190,167 @@ func TestWebhookSameEventIDDifferentMapIsNotDeduped(t *testing.T) {
 
 	if qLen := len(svc.queue); qLen != 2 {
 		t.Fatalf("expected two queued jobs for different maps, got %d", qLen)
+	}
+}
+
+func TestWebhookQueueFullDoesNotOverrideAlreadyQueuedState(t *testing.T) {
+	t.Setenv("WEBHOOK_HEADER_NAME", "X-Test-Secret")
+	t.Setenv("WEBHOOK_HEADER_VALUE", "secret-value")
+	t.Setenv("REPLAYS_DIR", t.TempDir())
+	logger = zap.NewNop()
+
+	svc, err := newReplayService()
+	if err != nil {
+		t.Fatalf("newReplayService failed: %v", err)
+	}
+	svc.queue = make(chan replayWork, 1)
+
+	first := faceitDemoReadyEvent{}
+	first.Event = "match_demo_ready"
+	first.EventID = "evt-first"
+	first.Payload.ID = "1-b6f50ed3-2da2-4379-bc8b-19e18874f509"
+	first.Payload.Game = "cs2"
+	first.Payload.Round = 1
+	first.Payload.DemoURL = "https://pappa.aukko.net/demos/x/1-b6f50ed3-2da2-4379-bc8b-19e18874f509-1.dem.zst"
+	first.Payload.MatchInstanceID = "1-b6f50ed3-2da2-4379-bc8b-19e18874f509-1-1"
+
+	body1, _ := json.Marshal(first)
+	req1 := httptest.NewRequest(http.MethodPost, "/webhooks/faceit/demo-ready", bytes.NewReader(body1))
+	req1.Header.Set("X-Test-Secret", "secret-value")
+	rr1 := httptest.NewRecorder()
+	svc.webhookDemoReadyHandler(rr1, req1)
+	if rr1.Code != http.StatusAccepted {
+		t.Fatalf("expected first webhook to be accepted, got %d", rr1.Code)
+	}
+
+	second := first
+	second.EventID = "evt-second"
+	body2, _ := json.Marshal(second)
+	req2 := httptest.NewRequest(http.MethodPost, "/webhooks/faceit/demo-ready", bytes.NewReader(body2))
+	req2.Header.Set("X-Test-Secret", "secret-value")
+	rr2 := httptest.NewRecorder()
+	svc.webhookDemoReadyHandler(rr2, req2)
+	if rr2.Code != http.StatusAccepted {
+		t.Fatalf("expected second webhook to be accepted for already queued replay, got %d", rr2.Code)
+	}
+
+	svc.mu.RLock()
+	rec, ok := svc.records[replayRecordKey(first.Payload.ID, "1")]
+	svc.mu.RUnlock()
+	if !ok {
+		t.Fatalf("expected replay record to exist")
+	}
+	if rec.State != replayStateQueued {
+		t.Fatalf("expected queued state, got %s", rec.State)
+	}
+	if rec.LastError != "" {
+		t.Fatalf("expected empty last_error for queued replay, got %q", rec.LastError)
+	}
+}
+
+func TestReplayStatePersistenceRoundTrip(t *testing.T) {
+	t.Setenv("REPLAYS_DIR", t.TempDir())
+	logger = zap.NewNop()
+
+	svc, err := newReplayService()
+	if err != nil {
+		t.Fatalf("newReplayService failed: %v", err)
+	}
+
+	now := time.Now().UTC()
+	svc.mu.Lock()
+	svc.records[replayRecordKey("demo-1", "2")] = &replayRecord{
+		MatchID:            "demo-1",
+		MapID:              "2",
+		MatchInstanceID:    "demo-1-2-1",
+		State:              replayStateQueued,
+		DemoURL:            "https://pappa.aukko.net/demos/x/demo-1-2.dem.zst",
+		LastEventID:        "evt-1",
+		LastUpdatedAt:      now,
+		CreatedAt:          now,
+		LastWebhookEventAt: now,
+	}
+	svc.latestMapByMatch["demo-1"] = "2"
+	svc.seenEvents["evt-1::demo-1::2"] = struct{}{}
+	svc.mu.Unlock()
+
+	if err := svc.persistState(); err != nil {
+		t.Fatalf("persistState failed: %v", err)
+	}
+
+	reloaded, err := newReplayService()
+	if err != nil {
+		t.Fatalf("newReplayService reload failed: %v", err)
+	}
+
+	reloaded.mu.RLock()
+	rec, ok := reloaded.records[replayRecordKey("demo-1", "2")]
+	_, seen := reloaded.seenEvents["evt-1::demo-1::2"]
+	latest := reloaded.latestMapByMatch["demo-1"]
+	reloaded.mu.RUnlock()
+
+	if !ok {
+		t.Fatalf("expected record to be loaded from persisted state")
+	}
+	if rec.State != replayStateQueued {
+		t.Fatalf("expected queued state after reload, got %s", rec.State)
+	}
+	if rec.DemoURL == "" {
+		t.Fatalf("expected demo_url to survive reload")
+	}
+	if latest != "2" {
+		t.Fatalf("expected latest map 2 after reload, got %s", latest)
+	}
+	if !seen {
+		t.Fatalf("expected seen event to survive reload")
+	}
+}
+
+func TestRecoverPendingJobsRequeuesQueuedAndParsing(t *testing.T) {
+	t.Setenv("REPLAYS_DIR", t.TempDir())
+	t.Setenv("QUEUE_SIZE", "10")
+	logger = zap.NewNop()
+
+	svc, err := newReplayService()
+	if err != nil {
+		t.Fatalf("newReplayService failed: %v", err)
+	}
+
+	now := time.Now().UTC()
+	svc.mu.Lock()
+	svc.records[replayRecordKey("demo-1", "1")] = &replayRecord{
+		MatchID:            "demo-1",
+		MapID:              "1",
+		State:              replayStateQueued,
+		DemoURL:            "https://pappa.aukko.net/demos/x/demo-1-1.dem.zst",
+		LastEventID:        "evt-1",
+		LastWebhookEventAt: now,
+		CreatedAt:          now,
+		LastUpdatedAt:      now,
+	}
+	svc.records[replayRecordKey("demo-1", "2")] = &replayRecord{
+		MatchID:            "demo-1",
+		MapID:              "2",
+		State:              replayStateParsing,
+		DemoURL:            "https://pappa.aukko.net/demos/x/demo-1-2.dem.zst",
+		LastEventID:        "evt-2",
+		LastWebhookEventAt: now,
+		CreatedAt:          now,
+		LastUpdatedAt:      now,
+	}
+	svc.mu.Unlock()
+
+	svc.recoverPendingJobs()
+
+	if qLen := len(svc.queue); qLen != 2 {
+		t.Fatalf("expected two recovered jobs in queue, got %d", qLen)
+	}
+
+	svc.mu.RLock()
+	rec := svc.records[replayRecordKey("demo-1", "2")]
+	svc.mu.RUnlock()
+	if rec.State != replayStateQueued {
+		t.Fatalf("expected parsing record to be reset to queued, got %s", rec.State)
 	}
 }
 
