@@ -7,11 +7,61 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"go.uber.org/zap"
 )
+
+func TestParseCSVList(t *testing.T) {
+	keys := parseCSVList("key-a, key-b ,,key-c")
+	if len(keys) != 3 {
+		t.Fatalf("expected 3 keys, got %d", len(keys))
+	}
+	if keys[0] != "key-a" || keys[1] != "key-b" || keys[2] != "key-c" {
+		t.Fatalf("unexpected parsed keys: %#v", keys)
+	}
+}
+
+func TestResolveDemoDownloadURLUsesFaceitDownloadsAPIWithKeyFallback(t *testing.T) {
+	requestCount := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if r.Method != http.MethodPost {
+			t.Fatalf("expected POST, got %s", r.Method)
+		}
+		if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+			t.Fatalf("expected Bearer auth header")
+		}
+
+		if r.Header.Get("Authorization") == "Bearer bad-key" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"payload":{"download_url":"https://signed.example.com/demo.dem.zst?sig=ok"}}`))
+	}))
+	defer ts.Close()
+
+	svc := &replayService{
+		faceitDownloadAPIURL:  ts.URL,
+		faceitDownloadAPIKeys: []string{"bad-key", "good-key"},
+		httpClient:            ts.Client(),
+	}
+
+	resolved, err := svc.resolveDemoDownloadURL("https://demos.faceit.com/cs2/1-cb038819-b0d0-4471-b25c-0e7468ab1eb1-1-1.dem.gz")
+	if err != nil {
+		t.Fatalf("expected faceit url to resolve via downloads api, got err: %v", err)
+	}
+	if !strings.HasPrefix(resolved, "https://signed.example.com/demo.dem.zst") {
+		t.Fatalf("unexpected resolved signed url: %s", resolved)
+	}
+	if requestCount != 2 {
+		t.Fatalf("expected two requests (key fallback), got %d", requestCount)
+	}
+}
 
 func TestValidateFaceitDemoReady(t *testing.T) {
 	valid := faceitDemoReadyEvent{}

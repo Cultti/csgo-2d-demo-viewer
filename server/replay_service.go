@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"compress/gzip"
 	"crypto/subtle"
 	"encoding/binary"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -32,6 +34,7 @@ const (
 	defaultWebhookHeader = "X-Webhook-Secret"
 	defaultReplaysDir    = "./parsed"
 	defaultStateFileName = "replay_state.json"
+	defaultFaceitDownloadAPIURL = "https://open.faceit.com/download/v2/demos/download"
 	maxWebhookBodyBytes  = 1 << 20
 )
 
@@ -101,7 +104,19 @@ type replayService struct {
 	webhookHeaderName string
 	webhookHeaderVal  string
 	adminToken        string
+	faceitDownloadAPIURL  string
+	faceitDownloadAPIKeys []string
 	httpClient        *http.Client
+}
+
+type faceitDownloadAPIRequest struct {
+	ResourceURL string `json:"resource_url"`
+}
+
+type faceitDownloadAPIResponse struct {
+	Payload struct {
+		DownloadURL string `json:"download_url"`
+	} `json:"payload"`
 }
 
 type replayPersistentState struct {
@@ -131,6 +146,11 @@ func newReplayService() (*replayService, error) {
 	if stateFile == "" {
 		stateFile = filepath.Join(replaysDir, defaultStateFileName)
 	}
+	faceitDownloadAPIURL := strings.TrimSpace(os.Getenv("FACEIT_DOWNLOAD_API_URL"))
+	if faceitDownloadAPIURL == "" {
+		faceitDownloadAPIURL = defaultFaceitDownloadAPIURL
+	}
+	faceitDownloadAPIKeys := parseCSVList(os.Getenv("FACEIT_DOWNLOAD_API_KEYS"))
 
 	svc := &replayService{
 		records:           map[string]*replayRecord{},
@@ -143,6 +163,8 @@ func newReplayService() (*replayService, error) {
 		webhookHeaderName: headerName,
 		webhookHeaderVal:  os.Getenv("WEBHOOK_HEADER_VALUE"),
 		adminToken:        os.Getenv("ADMIN_REPROCESS_TOKEN"),
+		faceitDownloadAPIURL:  faceitDownloadAPIURL,
+		faceitDownloadAPIKeys: faceitDownloadAPIKeys,
 		httpClient: &http.Client{
 			Timeout: 5 * time.Minute,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -153,7 +175,116 @@ func newReplayService() (*replayService, error) {
 	if err := svc.loadState(); err != nil {
 		return nil, err
 	}
+	if len(faceitDownloadAPIKeys) > 0 {
+		logger.Info("configured Faceit Downloads API keys", zap.Int("key_count", len(faceitDownloadAPIKeys)))
+	}
 	return svc, nil
+}
+
+func parseCSVList(raw string) []string {
+	items := strings.Split(raw, ",")
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		trimmed := strings.TrimSpace(item)
+		if trimmed == "" {
+			continue
+		}
+		out = append(out, trimmed)
+	}
+	return out
+}
+
+func isPappaDemoHost(host string) bool {
+	return strings.EqualFold(host, "pappa.aukko.net")
+}
+
+func isFaceitDemoHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if h == "" {
+		return false
+	}
+	return strings.Contains(h, "faceit")
+}
+
+func (s *replayService) resolveDemoDownloadURL(rawDemoURL string) (string, error) {
+	parsed, err := url.Parse(rawDemoURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid demo url: %w", err)
+	}
+
+	host := strings.TrimSpace(parsed.Host)
+	if isPappaDemoHost(host) {
+		return secureDemoUrl(rawDemoURL, isDev)
+	}
+
+	if isFaceitDemoHost(host) {
+		if len(s.faceitDownloadAPIKeys) == 0 {
+			return "", fmt.Errorf("faceit demo url requires FACEIT_DOWNLOAD_API_KEYS configuration")
+		}
+		signedURL, err := s.fetchSignedFaceitDemoURL(rawDemoURL)
+		if err != nil {
+			return "", err
+		}
+		if strings.TrimSpace(signedURL) == "" {
+			return "", fmt.Errorf("faceit download api returned an empty signed url")
+		}
+		return signedURL, nil
+	}
+
+	return secureDemoUrl(rawDemoURL, isDev)
+}
+
+func (s *replayService) fetchSignedFaceitDemoURL(resourceURL string) (string, error) {
+	body := faceitDownloadAPIRequest{ResourceURL: resourceURL}
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return "", err
+	}
+
+	var lastErr error
+	for _, apiKey := range s.faceitDownloadAPIKeys {
+		req, err := http.NewRequest(http.MethodPost, s.faceitDownloadAPIURL, bytes.NewReader(bodyBytes))
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := s.httpClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("downloads api request failed: %w", err)
+			continue
+		}
+
+		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
+		resp.Body.Close()
+		if readErr != nil {
+			lastErr = fmt.Errorf("downloads api response read failed: %w", readErr)
+			continue
+		}
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			lastErr = fmt.Errorf("downloads api status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+			continue
+		}
+
+		var out faceitDownloadAPIResponse
+		if err := json.Unmarshal(respBody, &out); err != nil {
+			lastErr = fmt.Errorf("downloads api invalid json response: %w", err)
+			continue
+		}
+		if strings.TrimSpace(out.Payload.DownloadURL) == "" {
+			lastErr = fmt.Errorf("downloads api response missing payload.download_url")
+			continue
+		}
+
+		return out.Payload.DownloadURL, nil
+	}
+
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("no faceit downloads api keys configured")
 }
 
 func eventDedupeKey(eventID string, matchID string, mapID string) string {
@@ -370,7 +501,7 @@ func (s *replayService) removeFromQueueOrderLocked(key string) {
 }
 
 func (s *replayService) process(job replayWork) error {
-	secureURL, err := secureDemoUrl(job.DemoURL, isDev)
+	secureURL, err := s.resolveDemoDownloadURL(job.DemoURL)
 	if err != nil {
 		return fmt.Errorf("invalid demo url: %w", err)
 	}
