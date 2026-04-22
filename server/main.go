@@ -44,6 +44,7 @@ func main() {
 	port := flag.Int("port", defaultPort, "port to listen on")
 	host := flag.String("host", envOrDefault("HOST", ""), "host/IP to bind (empty means all interfaces)")
 	webDir := flag.String("web-dir", envOrDefault("WEB_DIST_DIR", "../web/dist"), "path to web dist directory")
+	parseWorkers := flag.Int("parse-workers", envInt("PARSE_WORKERS", 1), "number of concurrent demo parse workers")
 	flag.Parse()
 	isDev = *dev
 
@@ -59,7 +60,7 @@ func main() {
 	if err != nil {
 		logger.Fatal("failed to initialize replay service", zap.Error(err))
 	}
-	replay.startWorkers(1)
+	replay.startWorkers(*parseWorkers)
 
 	http.HandleFunc("/download", downloadHandler)
 	http.HandleFunc("/webhooks/faceit/demo-ready", replay.webhookDemoReadyHandler)
