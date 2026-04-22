@@ -13,4 +13,5 @@ testdemos/
 .env.local
 web/dist/
 server/csgo-2d-demo-player
-server/parsed/deploy/
+server/parsed/
+deploy/
