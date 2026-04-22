@@ -27,6 +27,35 @@ const FACEIT_MATCH_ID_PATTERN = new RegExp(`/(${FACEIT_MATCH_ID_CORE})(?:-\\d+-\
 
 // Pattern to validate a faceit_match_id URL parameter (exact match, no suffix).
 const FACEIT_MATCH_ID_VALIDATION_PATTERN = new RegExp(`^${FACEIT_MATCH_ID_CORE}$`, "i");
+const FACEIT_MAP_ID_VALIDATION_PATTERN = /^\d+$/;
+
+async function gunzipArrayBuffer(buffer) {
+  if (typeof DecompressionStream === "undefined") {
+    throw new Error("Browser does not support DecompressionStream for gzip replay artifacts");
+  }
+  const stream = new Blob([buffer]).stream().pipeThrough(new DecompressionStream("gzip"));
+  return new Response(stream).arrayBuffer();
+}
+
+async function emitReplayStreamToLoaderBus(compressedBuffer, loaderMessageBus) {
+  const decodedBuffer = await gunzipArrayBuffer(compressedBuffer);
+  const bytes = new Uint8Array(decodedBuffer);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let offset = 0;
+
+  while (offset + 4 <= bytes.length) {
+    const messageLength = view.getUint32(offset, true);
+    offset += 4;
+    if (messageLength <= 0 || offset + messageLength > bytes.length) {
+      throw new Error("Corrupted replay stream payload");
+    }
+
+    const payload = bytes.subarray(offset, offset + messageLength);
+    offset += messageLength;
+    const msg = proto.Message.deserializeBinary(payload).toObject();
+    loaderMessageBus.emit(msg);
+  }
+}
 
 export function PlayerApp() {
   const location = useLocation();
@@ -105,24 +134,84 @@ export function PlayerApp() {
 
   useEffect(() => {
     console.log("isWasmLoaded", isWasmLoaded);
+    let cancelled = false;
+
     if (isWasmLoaded && demoData.demoData) {
       console.log("Posting demo data to worker.");
       const toPost = demoData.demoData;
       demoData.setDemoData(null);
       worker.current.postMessage(toPost, [toPost.data.buffer]);
     } else if (isWasmLoaded && location.query.faceit_match_id) {
-      // Handle Faceit match ID parameter
       const matchId = location.query.faceit_match_id;
-      
+      const mapId = location.query.map_id ? String(location.query.map_id) : "";
+
       if (!FACEIT_MATCH_ID_VALIDATION_PATTERN.test(matchId)) {
         setIsError(true);
         setLoadingMessage(["Invalid Faceit match ID format"]);
         return;
       }
-      
-      // Show dialog to inform user about Faceit download option
-      setFaceitMatchId(matchId);
-      setShowFaceitDialog(true);
+
+      if (mapId && !FACEIT_MAP_ID_VALIDATION_PATTERN.test(mapId)) {
+        setIsError(true);
+        setLoadingMessage(["Invalid map_id format"]);
+        return;
+      }
+
+      setIsError(false);
+      setIsDownloading(true);
+      setLoadingMessage(["Waiting for server-side parse..."]);
+
+      const pollAndLoadReplay = async () => {
+        const maxAttempts = 300;
+        const pollIntervalMs = 2000;
+
+        for (let i = 0; i < maxAttempts && !cancelled; i++) {
+          try {
+            const statusResp = await axios.get(`${downloadServer}/replays/${encodeURIComponent(matchId)}/status`, {
+              params: mapId ? { map_id: mapId } : undefined,
+            });
+            const state = statusResp?.data?.state;
+
+            if (state === "ready") {
+              setLoadingMessage(["Loading parsed replay..."]);
+              const replayResp = await axios.get(`${downloadServer}/replays/${encodeURIComponent(matchId)}`, {
+                responseType: "arraybuffer",
+                params: mapId ? { map_id: mapId } : undefined,
+              });
+              await emitReplayStreamToLoaderBus(replayResp.data, loaderMessageBus);
+              setIsDownloading(false);
+              return;
+            }
+
+            if (state === "failed") {
+              throw new Error(statusResp?.data?.last_error || "Server-side parsing failed");
+            }
+
+            setLoadingMessage([`Server parsing status: ${state || "queued"}...`]);
+          } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 404) {
+              setLoadingMessage(["Replay not found yet, waiting for webhook processing..."]);
+            } else {
+              throw error;
+            }
+          }
+
+          await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+        }
+
+        if (!cancelled) {
+          throw new Error("Timed out waiting for server-side parsed replay");
+        }
+      };
+
+      pollAndLoadReplay().catch((error) => {
+        if (cancelled) {
+          return;
+        }
+        setIsDownloading(false);
+        setIsError(true);
+        setLoadingMessage(["Error loading parsed replay: " + (error?.message || "unknown error")]);
+      });
     } else if (isWasmLoaded && location.query.demourl) {
       const demoUrl = location.query.demourl;
       setIsDownloading(true);
@@ -160,8 +249,11 @@ export function PlayerApp() {
           if (matchIdMatch && matchIdMatch[1]) {
             const matchId = matchIdMatch[1];
             console.log("Extracted match ID from demo URL:", matchId);
+            const mapIdMatch = demoUrl.match(/-(\d+)-(\d+)\.dem\./i);
+            const mapIdFromUrl = mapIdMatch && mapIdMatch[1] ? mapIdMatch[1] : null;
             // Update URL to use faceit_match_id instead of demourl without reloading
-            const newUrl = `/player?faceit_match_id=${encodeURIComponent(matchId)}`;
+            const mapQuery = mapIdFromUrl ? `&map_id=${encodeURIComponent(mapIdFromUrl)}` : "";
+            const newUrl = `/player?faceit_match_id=${encodeURIComponent(matchId)}${mapQuery}`;
             window.history.replaceState({}, '', newUrl);
           }
           
@@ -175,6 +267,10 @@ export function PlayerApp() {
           setLoadingMessage(["Error downloading demo: " + error.message]);
         });
     }
+
+    return () => {
+      cancelled = true;
+    };
   }, [isWasmLoaded]);
 
   return (

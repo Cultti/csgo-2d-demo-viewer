@@ -1,0 +1,26 @@
+[Unit]
+Description=CS Demo Viewer Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tuntsa
+Group=tuntsa
+WorkingDirectory=/home/tuntsa/csdemo
+Environment=PORT=8949
+Environment=HOST=127.0.0.1
+Environment=WEB_DIST_DIR=/home/tuntsa/csdemo/web/dist
+Environment=WEBHOOK_HEADER_NAME=Authorization
+Environment=WEBHOOK_HEADER_VALUE=pappa-demot-123
+ExecStart=/usr/bin/bash /home/tuntsa/csdemo/run.sh
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+ReadWritePaths=/home/tuntsa/csdemo
+
+[Install]
+WantedBy=multi-user.target

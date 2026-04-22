@@ -138,24 +138,26 @@ func secureDemoUrl(urlParam string, isDev bool) (string, error) {
 		return "", fmt.Errorf("too long URL")
 	}
 
-	// In development mode, only allow http://localhost:8080
-	if isDev {
-		if parsedURL.Scheme != "http" || parsedURL.Host != "localhost:8080" {
-			logger.Warn("Development mode: forbidden scheme or host", zap.String("scheme", parsedURL.Scheme), zap.String("host", parsedURL.Host))
-			return "", fmt.Errorf("development mode: only http://localhost:8080 is allowed, got: %s", parsedURL.String())
-		}
-		// In dev mode, return the URL as-is (already validated above)
+	// In development mode, allow local test demos directly.
+	if isDev && parsedURL.Scheme == "http" && parsedURL.Host == "localhost:8080" {
 		return urlParam, nil
 	}
 
-	// Production mode: only allow https and strict whitelist of allowed hosts
+	// Allow pappa.aukko.net debug host as-is (HTTPS only) in all modes.
+	if parsedURL.Scheme == "https" && parsedURL.Host == "pappa.aukko.net" {
+		return urlParam, nil
+	}
+
+	// Outside local dev localhost, only allow https and strict whitelist of allowed hosts.
 	if parsedURL.Scheme != "https" {
-		logger.Warn("Production mode: forbidden scheme", zap.String("scheme", parsedURL.Scheme))
-		return "", fmt.Errorf("production mode: only https scheme allowed, got: %s", parsedURL.Scheme)
+		logger.Warn("forbidden scheme", zap.String("scheme", parsedURL.Scheme))
+		return "", fmt.Errorf("only https scheme allowed, got: %s", parsedURL.Scheme)
 	}
 	allowedHosts := []string{
 		"demos-europe-central-faceit-cdn.s3.eu-central-003.backblazeb2.com",
 		"demos-us-east-faceit-cdn.s3.us-east-005.backblazeb2.com",
+		"demos-europe-central.backblaze.faceit-cdn.net",
+		"demos-us-east.backblaze.faceit-cdn.net",
 	}
 
 	// Check that the host is in the allowed list

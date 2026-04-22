@@ -7,6 +7,7 @@ A lightweight Go HTTP server that serves the web application and proxies demo fi
 This server component provides two main functions:
 1. **Static file serving**: Serves the built web application (HTML, JS, CSS, WASM files)
 2. **Demo download proxy**: Securely proxies demo file downloads from external sources (e.g., FACEIT)
+3. **Webhook ingest pipeline**: Accepts Faceit demo-ready events, downloads demos in background workers, and exposes replay readiness/status endpoints
 
 ## Technology Stack
 
@@ -80,6 +81,49 @@ Proxies demo file downloads from external sources.
 curl "http://localhost:8080/download?url=https://example.com/demo.dem.zst"
 ```
 
+### `POST /webhooks/faceit/demo-ready`
+
+Receives a Faceit `match_demo_ready` webhook payload and enqueues demo ingestion.
+
+**Headers:**
+- `<WEBHOOK_HEADER_NAME>`: Must match configured secret value
+
+**Required environment variables:**
+- `WEBHOOK_HEADER_NAME` (optional, default `X-Webhook-Secret`)
+- `WEBHOOK_HEADER_VALUE` (required)
+
+**Behavior:**
+- Validates event and payload
+- Deduplicates by webhook `event_id`
+- Returns `202 Accepted` when queued
+
+### `GET /replays/<match_id>/status`
+
+Returns replay state for a match.
+
+**States:**
+- `missing`
+- `queued`
+- `parsing`
+- `ready`
+- `failed`
+
+### `GET /replays/<match_id>`
+
+Read-only replay fetch endpoint. Returns prepared replay artifact when state is `ready`. Returns `202` with state payload while processing.
+
+### `POST /admin/replays/reprocess`
+
+Admin-only manual reprocess endpoint.
+
+**Headers:**
+- `X-Admin-Token`: Must match `ADMIN_REPROCESS_TOKEN`
+
+**Body:**
+- `match_id` (required)
+- `demo_url` (required)
+- `map_id` (optional)
+
 ### Static File Serving
 
 All other requests serve static files from the web application build directory.
@@ -87,6 +131,11 @@ All other requests serve static files from the web application build directory.
 ## Configuration
 
 - `-dev`: Enable development mode (default: `false`)
+- `WEBHOOK_HEADER_NAME`: Static webhook auth header name (default: `X-Webhook-Secret`)
+- `WEBHOOK_HEADER_VALUE`: Static webhook auth header value (required for webhook ingest)
+- `ADMIN_REPROCESS_TOKEN`: Static admin token for manual reprocess endpoint
+- `REPLAYS_DIR`: Filesystem directory for replay artifacts and metadata (default: `./parsed`)
+- `ALLOWED_ORIGINS`: Comma-separated CORS allowlist for production `GET /download`
 
 ## How It Works
 
@@ -97,3 +146,8 @@ All other requests serve static files from the web application build directory.
    - The server fetches the file from the external source
    - The file is streamed back to the client in chunks
 3. **CORS**: In dev mode, CORS headers allow the web app to make requests from different origins
+4. **Webhook Ingest**:
+   - Faceit webhook hits `/webhooks/faceit/demo-ready`
+   - Server validates static secret header and payload
+   - Background worker downloads demo and stores artifact under `parsed/<match_id>/`
+   - Client can poll `/replays/<match_id>/status` and load `/replays/<match_id>` when ready
