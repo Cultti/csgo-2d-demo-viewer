@@ -93,6 +93,7 @@ type replayService struct {
 	records           map[string]*replayRecord
 	latestMapByMatch  map[string]string
 	seenEvents        map[string]struct{}
+	queueOrder        []string
 	queue             chan replayWork
 	replaysDir        string
 	stateFile         string
@@ -108,6 +109,7 @@ type replayPersistentState struct {
 	Records          map[string]replayRecord `json:"records"`
 	LatestMapByMatch map[string]string       `json:"latest_map_by_match"`
 	SeenEvents       []string                `json:"seen_events"`
+	QueueOrder       []string                `json:"queue_order"`
 }
 
 func newReplayService() (*replayService, error) {
@@ -134,6 +136,7 @@ func newReplayService() (*replayService, error) {
 		records:           map[string]*replayRecord{},
 		latestMapByMatch:  map[string]string{},
 		seenEvents:        map[string]struct{}{},
+		queueOrder:        make([]string, 0),
 		queue:             make(chan replayWork, queueSize),
 		replaysDir:        replaysDir,
 		stateFile:         stateFile,
@@ -169,26 +172,48 @@ func (s *replayService) startWorkers(n int) {
 
 func (s *replayService) recoverPendingJobs() {
 	now := time.Now().UTC()
+	jobsByKey := make(map[string]replayWork)
 	jobs := make([]replayWork, 0)
 
 	s.mu.Lock()
 	for _, rec := range s.records {
+		key := replayRecordKey(rec.MatchID, rec.MapID)
 		if rec.State == replayStateParsing {
 			rec.State = replayStateQueued
 			rec.LastError = ""
 			rec.LastUpdatedAt = now
 		}
 		if rec.State == replayStateQueued && strings.TrimSpace(rec.DemoURL) != "" {
-			jobs = append(jobs, replayWork{
+			jobsByKey[key] = replayWork{
 				EventID:         rec.LastEventID,
 				MatchID:         rec.MatchID,
 				MapID:           rec.MapID,
 				MatchInstanceID: rec.MatchInstanceID,
 				DemoURL:         rec.DemoURL,
 				Timestamp:       rec.LastWebhookEventAt,
-			})
+			}
 		}
 	}
+
+	recoveredQueueOrder := make([]string, 0, len(jobsByKey))
+	seenQueueKeys := make(map[string]struct{})
+	for _, key := range s.queueOrder {
+		job, ok := jobsByKey[key]
+		if !ok {
+			continue
+		}
+		recoveredQueueOrder = append(recoveredQueueOrder, key)
+		jobs = append(jobs, job)
+		seenQueueKeys[key] = struct{}{}
+	}
+	for key, job := range jobsByKey {
+		if _, exists := seenQueueKeys[key]; exists {
+			continue
+		}
+		recoveredQueueOrder = append(recoveredQueueOrder, key)
+		jobs = append(jobs, job)
+	}
+	s.queueOrder = recoveredQueueOrder
 	s.mu.Unlock()
 
 	if len(jobs) == 0 {
@@ -237,11 +262,20 @@ func (s *replayService) loadState() error {
 		}
 		seen[key] = struct{}{}
 	}
+	queueOrder := make([]string, 0, len(persisted.QueueOrder))
+	for _, key := range persisted.QueueOrder {
+		trimmed := strings.TrimSpace(key)
+		if trimmed == "" {
+			continue
+		}
+		queueOrder = append(queueOrder, trimmed)
+	}
 
 	s.mu.Lock()
 	s.records = records
 	s.latestMapByMatch = latest
 	s.seenEvents = seen
+	s.queueOrder = queueOrder
 	s.mu.Unlock()
 
 	logger.Info("loaded replay state", zap.Int("records", len(records)), zap.Int("seen_events", len(seen)))
@@ -255,6 +289,7 @@ func (s *replayService) persistState() error {
 		Records:          make(map[string]replayRecord, len(s.records)),
 		LatestMapByMatch: make(map[string]string, len(s.latestMapByMatch)),
 		SeenEvents:       make([]string, 0, len(s.seenEvents)),
+		QueueOrder:       make([]string, 0, len(s.queueOrder)),
 	}
 	for key, rec := range s.records {
 		persisted.Records[key] = *rec
@@ -265,6 +300,7 @@ func (s *replayService) persistState() error {
 	for key := range s.seenEvents {
 		persisted.SeenEvents = append(persisted.SeenEvents, key)
 	}
+	persisted.QueueOrder = append(persisted.QueueOrder, s.queueOrder...)
 	s.mu.RUnlock()
 
 	s.persistMu.Lock()
@@ -276,6 +312,9 @@ func (s *replayService) persistState() error {
 func (s *replayService) workerLoop(id int) {
 	logger.Info("started replay worker", zap.Int("worker_id", id))
 	for job := range s.queue {
+		s.mu.Lock()
+		s.removeFromQueueOrderLocked(replayRecordKey(job.MatchID, job.MapID))
+		s.mu.Unlock()
 		s.updateState(job.MatchID, job.MapID, replayStateParsing, "", "", "", job.EventID)
 
 		if err := s.process(job); err != nil {
@@ -287,6 +326,46 @@ func (s *replayService) workerLoop(id int) {
 			s.updateState(job.MatchID, job.MapID, replayStateFailed, "", err.Error(), "", job.EventID)
 			continue
 		}
+	}
+}
+
+func (s *replayService) queuePositionLocked(matchID string, mapID string, state string) (int, int) {
+	key := replayRecordKey(matchID, mapID)
+	total := len(s.queueOrder)
+	if state == replayStateParsing {
+		return 0, total
+	}
+	for i, queuedKey := range s.queueOrder {
+		if queuedKey == key {
+			return i + 1, total
+		}
+	}
+	return -1, total
+}
+
+func (s *replayService) hasQueueKeyLocked(key string) bool {
+	for _, queuedKey := range s.queueOrder {
+		if queuedKey == key {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *replayService) appendQueueOrderLocked(key string) {
+	if s.hasQueueKeyLocked(key) {
+		return
+	}
+	s.queueOrder = append(s.queueOrder, key)
+}
+
+func (s *replayService) removeFromQueueOrderLocked(key string) {
+	for i, queuedKey := range s.queueOrder {
+		if queuedKey != key {
+			continue
+		}
+		s.queueOrder = append(s.queueOrder[:i], s.queueOrder[i+1:]...)
+		return
 	}
 }
 
@@ -581,8 +660,26 @@ func (s *replayService) webhookDemoReadyHandler(w http.ResponseWriter, r *http.R
 	rec.DemoURL = event.Payload.DemoURL
 	rec.LastEventID = event.EventID
 	rec.LastUpdatedAt = now
+	if rec.State == replayStateReady && strings.TrimSpace(rec.ArtifactPath) != "" {
+		rec.LastError = ""
+		s.latestMapByMatch[event.Payload.ID] = mapID
+		s.mu.Unlock()
+		if err := s.persistState(); err != nil {
+			logger.Error("failed to persist replay state", zap.Error(err))
+		}
+		writeJSON(w, http.StatusAccepted, map[string]string{
+			"match_id": event.Payload.ID,
+			"map_id":   mapID,
+			"state":    replayStateReady,
+			"result":   "already_ready",
+		})
+		return
+	}
 	if rec.State == replayStateQueued || rec.State == replayStateParsing {
 		rec.LastError = ""
+		if rec.State == replayStateQueued {
+			s.appendQueueOrderLocked(replayRecordKey(event.Payload.ID, mapID))
+		}
 		s.latestMapByMatch[event.Payload.ID] = mapID
 		s.seenEvents[dedupeKey] = struct{}{}
 		state := rec.State
@@ -622,6 +719,7 @@ func (s *replayService) webhookDemoReadyHandler(w http.ResponseWriter, r *http.R
 		rec.LastError = ""
 		rec.State = replayStateQueued
 		rec.LastUpdatedAt = now
+		s.appendQueueOrderLocked(replayRecordKey(event.Payload.ID, mapID))
 		s.latestMapByMatch[event.Payload.ID] = mapID
 		s.seenEvents[dedupeKey] = struct{}{}
 		s.mu.Unlock()
@@ -691,6 +789,10 @@ func (s *replayService) handleReplayStatus(w http.ResponseWriter, _ *http.Reques
 	s.mu.RLock()
 	rec, ok := s.getLocked(matchID, mapID)
 	mapIDs := s.mapIDsLocked(matchID)
+	queuePosition, queueTotal := -1, 0
+	if ok {
+		queuePosition, queueTotal = s.queuePositionLocked(rec.MatchID, rec.MapID, rec.State)
+	}
 	s.mu.RUnlock()
 	if !ok {
 		resp := map[string]any{
@@ -718,6 +820,12 @@ func (s *replayService) handleReplayStatus(w http.ResponseWriter, _ *http.Reques
 		"last_webhook_event_at": rec.LastWebhookEventAt,
 		"map_ids":             mapIDs,
 	}
+	if rec.State == replayStateQueued || rec.State == replayStateParsing {
+		if queuePosition >= 0 {
+			resp["queue_position"] = queuePosition
+		}
+		resp["queue_total"] = queueTotal
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -734,12 +842,22 @@ func (s *replayService) handleReplayFetch(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if rec.State != replayStateReady || rec.ArtifactPath == "" {
-		writeJSON(w, http.StatusAccepted, map[string]string{
+		s.mu.RLock()
+		queuePosition, queueTotal := s.queuePositionLocked(rec.MatchID, rec.MapID, rec.State)
+		s.mu.RUnlock()
+		resp := map[string]any{
 			"match_id": rec.MatchID,
 			"map_id":   rec.MapID,
 			"state":    rec.State,
 			"error":    rec.LastError,
-		})
+		}
+		if rec.State == replayStateQueued || rec.State == replayStateParsing {
+			if queuePosition >= 0 {
+				resp["queue_position"] = queuePosition
+			}
+			resp["queue_total"] = queueTotal
+		}
+		writeJSON(w, http.StatusAccepted, resp)
 		return
 	}
 

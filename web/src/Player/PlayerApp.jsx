@@ -163,7 +163,7 @@ export function PlayerApp() {
 
       const pollAndLoadReplay = async () => {
         const maxAttempts = 300;
-        const pollIntervalMs = 2000;
+        const pollIntervalMs = 30000;
 
         for (let i = 0; i < maxAttempts && !cancelled; i++) {
           try {
@@ -187,7 +187,17 @@ export function PlayerApp() {
               throw new Error(statusResp?.data?.last_error || "Server-side parsing failed");
             }
 
-            setLoadingMessage([`Server parsing status: ${state || "queued"}...`]);
+            const queuePosition = statusResp?.data?.queue_position;
+            const queueTotal = statusResp?.data?.queue_total;
+            if ((state === "queued" || state === "parsing") && Number.isFinite(queuePosition) && Number.isFinite(queueTotal)) {
+              if (queuePosition === 0) {
+                setLoadingMessage([`Server parsing status: ${state} (processing now, queue: ${queueTotal})...`]);
+              } else {
+                setLoadingMessage([`Server parsing status: ${state} (position ${queuePosition}/${queueTotal})...`]);
+              }
+            } else {
+              setLoadingMessage([`Server parsing status: ${state || "queued"}...`]);
+            }
           } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 404) {
               setLoadingMessage(["Replay not found yet, waiting for webhook processing..."]);

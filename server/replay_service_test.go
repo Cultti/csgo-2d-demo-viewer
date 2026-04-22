@@ -146,6 +146,62 @@ func TestWebhookDuplicateEventIsAcceptedAndNotRequeued(t *testing.T) {
 	}
 }
 
+func TestWebhookReadyReplayIsNotRequeued(t *testing.T) {
+	t.Setenv("WEBHOOK_HEADER_NAME", "X-Test-Secret")
+	t.Setenv("WEBHOOK_HEADER_VALUE", "secret-value")
+	t.Setenv("REPLAYS_DIR", t.TempDir())
+	logger = zap.NewNop()
+
+	svc, err := newReplayService()
+	if err != nil {
+		t.Fatalf("newReplayService failed: %v", err)
+	}
+
+	now := time.Now().UTC()
+	svc.mu.Lock()
+	svc.records[replayRecordKey("1-72891900-e990-4f3a-a73c-2fe2b4f43abb", "2")] = &replayRecord{
+		MatchID:       "1-72891900-e990-4f3a-a73c-2fe2b4f43abb",
+		MapID:         "2",
+		State:         replayStateReady,
+		ArtifactPath:  "/tmp/already-ready.pbr.gz",
+		CreatedAt:     now,
+		LastUpdatedAt: now,
+	}
+	svc.latestMapByMatch["1-72891900-e990-4f3a-a73c-2fe2b4f43abb"] = "2"
+	svc.mu.Unlock()
+
+	payload := faceitDemoReadyEvent{}
+	payload.Event = "match_demo_ready"
+	payload.EventID = "evt-new-for-ready"
+	payload.Payload.ID = "1-72891900-e990-4f3a-a73c-2fe2b4f43abb"
+	payload.Payload.Game = "cs2"
+	payload.Payload.Round = 2
+	payload.Payload.DemoURL = "https://pappa.aukko.net/demos/x/1-72891900-e990-4f3a-a73c-2fe2b4f43abb-2.dem.zst"
+	payload.Payload.MatchInstanceID = "1-72891900-e990-4f3a-a73c-2fe2b4f43abb-2-1"
+
+	body, _ := json.Marshal(payload)
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/faceit/demo-ready", bytes.NewReader(body))
+	req.Header.Set("X-Test-Secret", "secret-value")
+	rr := httptest.NewRecorder()
+	svc.webhookDemoReadyHandler(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("expected webhook to be accepted for already-ready replay, got %d", rr.Code)
+	}
+
+	var resp map[string]string
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp["result"] != "already_ready" {
+		t.Fatalf("expected result already_ready, got %q", resp["result"])
+	}
+
+	if qLen := len(svc.queue); qLen != 0 {
+		t.Fatalf("expected no new queued jobs for already-ready replay, got %d", qLen)
+	}
+}
+
 func TestWebhookSameEventIDDifferentMapIsNotDeduped(t *testing.T) {
 	t.Setenv("WEBHOOK_HEADER_NAME", "X-Test-Secret")
 	t.Setenv("WEBHOOK_HEADER_VALUE", "secret-value")
@@ -471,5 +527,43 @@ func TestReplayMapIDQuerySelection(t *testing.T) {
 	svc.replaysHandler(statusRes, statusReq)
 	if statusRes.Code != http.StatusOK {
 		t.Fatalf("expected 200 for map2 status, got %d", statusRes.Code)
+	}
+}
+
+func TestReplayStatusIncludesQueuePosition(t *testing.T) {
+	logger = zap.NewNop()
+	svc := &replayService{
+		records:          map[string]*replayRecord{},
+		latestMapByMatch: map[string]string{},
+		seenEvents:       map[string]struct{}{},
+		queueOrder:       []string{replayRecordKey("demo-1", "1"), replayRecordKey("demo-1", "2"), replayRecordKey("demo-1", "3")},
+		queue:            make(chan replayWork, 3),
+	}
+
+	now := time.Now().UTC()
+	svc.records[replayRecordKey("demo-1", "2")] = &replayRecord{
+		MatchID:       "demo-1",
+		MapID:         "2",
+		State:         replayStateQueued,
+		CreatedAt:     now,
+		LastUpdatedAt: now,
+	}
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/replays/demo-1/status?map_id=2", nil)
+	statusRes := httptest.NewRecorder()
+	svc.replaysHandler(statusRes, statusReq)
+	if statusRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 for status, got %d", statusRes.Code)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(statusRes.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("failed to decode status json: %v", err)
+	}
+	if got := int(payload["queue_position"].(float64)); got != 2 {
+		t.Fatalf("expected queue_position 2, got %d", got)
+	}
+	if got := int(payload["queue_total"].(float64)); got != 3 {
+		t.Fatalf("expected queue_total 3, got %d", got)
 	}
 }
