@@ -114,11 +114,13 @@ func newReplayService() (*replayService, error) {
 		headerName = defaultWebhookHeader
 	}
 
+	queueSize := envInt("QUEUE_SIZE", 1024)
+
 	svc := &replayService{
 		records:           map[string]*replayRecord{},
 		latestMapByMatch:  map[string]string{},
 		seenEvents:        map[string]struct{}{},
-		queue:             make(chan replayWork, 128),
+		queue:             make(chan replayWork, queueSize),
 		replaysDir:        replaysDir,
 		webhookHeaderName: headerName,
 		webhookHeaderVal:  os.Getenv("WEBHOOK_HEADER_VALUE"),
