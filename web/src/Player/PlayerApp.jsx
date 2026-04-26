@@ -57,6 +57,15 @@ async function emitReplayStreamToLoaderBus(compressedBuffer, loaderMessageBus) {
   }
 }
 
+function formatETAText(etaMinutes) {
+  if (!Number.isFinite(etaMinutes) || etaMinutes < 1) {
+    return "";
+  }
+  const roundedMinutes = Math.max(1, Math.ceil(etaMinutes));
+  const unit = roundedMinutes === 1 ? "minute" : "minutes";
+  return `, ETA ${roundedMinutes} ${unit}`;
+}
+
 export function PlayerApp() {
   const location = useLocation();
   const worker = useRef(null);
@@ -189,14 +198,17 @@ export function PlayerApp() {
 
             const queuePosition = statusResp?.data?.queue_position;
             const queueTotal = statusResp?.data?.queue_total;
+            const etaMinutes = statusResp?.data?.eta_minutes;
+            const etaText = formatETAText(etaMinutes);
             if ((state === "queued" || state === "parsing") && Number.isFinite(queuePosition) && Number.isFinite(queueTotal)) {
               if (queuePosition === 0) {
-                setLoadingMessage([`Server parsing status: ${state} (processing now, queue: ${queueTotal})...`]);
+                setLoadingMessage([`Server parsing status: ${state} (processing now, queue: ${queueTotal}${etaText})...`]);
               } else {
-                setLoadingMessage([`Server parsing status: ${state} (position ${queuePosition}/${queueTotal})...`]);
+                setLoadingMessage([`Server parsing status: ${state} (position ${queuePosition}/${queueTotal}${etaText})...`]);
               }
             } else {
-              setLoadingMessage([`Server parsing status: ${state || "queued"}...`]);
+              const fallbackETA = (state === "queued" || state === "parsing") ? etaText : "";
+              setLoadingMessage([`Server parsing status: ${state || "queued"}${fallbackETA}...`]);
             }
           } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 404) {

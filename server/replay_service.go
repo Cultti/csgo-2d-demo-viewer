@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/bzip2"
 	"compress/gzip"
 	"crypto/subtle"
 	"encoding/binary"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,30 +23,33 @@ import (
 
 	pmessage "csgo-2d-demo-player/pkg/message"
 	pparser "csgo-2d-demo-player/pkg/parser"
+	"github.com/klauspost/compress/zstd"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 )
 
 const (
-	replayStateMissing   = "missing"
-	replayStateQueued    = "queued"
-	replayStateParsing   = "parsing"
-	replayStateReady     = "ready"
-	replayStateFailed    = "failed"
-	defaultWebhookHeader = "X-Webhook-Secret"
-	defaultReplaysDir    = "./parsed"
-	defaultStateFileName = "replay_state.json"
+	replayStateMissing          = "missing"
+	replayStateQueued           = "queued"
+	replayStateParsing          = "parsing"
+	replayStateReady            = "ready"
+	replayStateFailed           = "failed"
+	defaultWebhookHeader        = "X-Webhook-Secret"
+	defaultReplaysDir           = "./parsed"
+	defaultStateFileName        = "replay_state.json"
 	defaultFaceitDownloadAPIURL = "https://open.faceit.com/download/v2/demos/download"
-	maxWebhookBodyBytes  = 1 << 20
+	maxWebhookBodyBytes         = 1 << 20
+	recentProcessingWindowSize  = 10
+	minDownloadedDemoBytes      = 4 << 10
 )
 
 type replayWork struct {
-	EventID   string
-	MatchID   string
-	MapID     string
+	EventID         string
+	MatchID         string
+	MapID           string
 	MatchInstanceID string
-	DemoURL   string
-	Timestamp time.Time
+	DemoURL         string
+	Timestamp       time.Time
 }
 
 type replayRecord struct {
@@ -92,21 +97,24 @@ type faceitDemoReadyEvent struct {
 }
 
 type replayService struct {
-	mu                sync.RWMutex
-	records           map[string]*replayRecord
-	latestMapByMatch  map[string]string
-	seenEvents        map[string]struct{}
-	queueOrder        []string
-	queue             chan replayWork
-	replaysDir        string
-	stateFile         string
-	persistMu         sync.Mutex
-	webhookHeaderName string
-	webhookHeaderVal  string
-	adminToken        string
+	mu                    sync.RWMutex
+	records               map[string]*replayRecord
+	latestMapByMatch      map[string]string
+	seenEvents            map[string]struct{}
+	queueOrder            []string
+	activeParses          int
+	workerCount           int
+	processingDurations   []time.Duration
+	queue                 chan replayWork
+	replaysDir            string
+	stateFile             string
+	persistMu             sync.Mutex
+	webhookHeaderName     string
+	webhookHeaderVal      string
+	adminToken            string
 	faceitDownloadAPIURL  string
 	faceitDownloadAPIKeys []string
-	httpClient        *http.Client
+	httpClient            *http.Client
 }
 
 type faceitDownloadAPIRequest struct {
@@ -120,11 +128,12 @@ type faceitDownloadAPIResponse struct {
 }
 
 type replayPersistentState struct {
-	Version          int                     `json:"version"`
-	Records          map[string]replayRecord `json:"records"`
-	LatestMapByMatch map[string]string       `json:"latest_map_by_match"`
-	SeenEvents       []string                `json:"seen_events"`
-	QueueOrder       []string                `json:"queue_order"`
+	Version               int                     `json:"version"`
+	Records               map[string]replayRecord `json:"records"`
+	LatestMapByMatch      map[string]string       `json:"latest_map_by_match"`
+	SeenEvents            []string                `json:"seen_events"`
+	QueueOrder            []string                `json:"queue_order"`
+	ProcessingDurationsMS []int64                 `json:"processing_durations_ms,omitempty"`
 }
 
 func newReplayService() (*replayService, error) {
@@ -153,16 +162,18 @@ func newReplayService() (*replayService, error) {
 	faceitDownloadAPIKeys := parseCSVList(os.Getenv("FACEIT_DOWNLOAD_API_KEYS"))
 
 	svc := &replayService{
-		records:           map[string]*replayRecord{},
-		latestMapByMatch:  map[string]string{},
-		seenEvents:        map[string]struct{}{},
-		queueOrder:        make([]string, 0),
-		queue:             make(chan replayWork, queueSize),
-		replaysDir:        replaysDir,
-		stateFile:         stateFile,
-		webhookHeaderName: headerName,
-		webhookHeaderVal:  os.Getenv("WEBHOOK_HEADER_VALUE"),
-		adminToken:        os.Getenv("ADMIN_REPROCESS_TOKEN"),
+		records:               map[string]*replayRecord{},
+		latestMapByMatch:      map[string]string{},
+		seenEvents:            map[string]struct{}{},
+		queueOrder:            make([]string, 0),
+		workerCount:           1,
+		processingDurations:   make([]time.Duration, 0, recentProcessingWindowSize),
+		queue:                 make(chan replayWork, queueSize),
+		replaysDir:            replaysDir,
+		stateFile:             stateFile,
+		webhookHeaderName:     headerName,
+		webhookHeaderVal:      os.Getenv("WEBHOOK_HEADER_VALUE"),
+		adminToken:            os.Getenv("ADMIN_REPROCESS_TOKEN"),
 		faceitDownloadAPIURL:  faceitDownloadAPIURL,
 		faceitDownloadAPIKeys: faceitDownloadAPIKeys,
 		httpClient: &http.Client{
@@ -295,10 +306,59 @@ func (s *replayService) startWorkers(n int) {
 	if n < 1 {
 		n = 1
 	}
+	s.mu.Lock()
+	s.workerCount = n
+	s.mu.Unlock()
+	s.cleanupStaleDownloadTempFiles()
 	for i := 0; i < n; i++ {
 		go s.workerLoop(i + 1)
 	}
 	go s.recoverPendingJobs()
+}
+
+func (s *replayService) cleanupStaleDownloadTempFiles() {
+	entries, err := os.ReadDir(s.replaysDir)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			logger.Error("failed to list replays directory for cleanup", zap.String("replays_dir", s.replaysDir), zap.Error(err))
+		}
+		return
+	}
+
+	removed := 0
+	failed := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		matchDir := filepath.Join(s.replaysDir, entry.Name())
+		files, err := os.ReadDir(matchDir)
+		if err != nil {
+			failed++
+			logger.Warn("failed to list match directory during stale temp cleanup", zap.String("match_dir", matchDir), zap.Error(err))
+			continue
+		}
+
+		for _, file := range files {
+			if file.IsDir() {
+				continue
+			}
+			name := file.Name()
+			if !strings.HasPrefix(name, "download-") || !strings.HasSuffix(name, ".dem.zst") {
+				continue
+			}
+			if err := os.Remove(filepath.Join(matchDir, name)); err != nil {
+				failed++
+				logger.Warn("failed to remove stale download temp file", zap.String("path", filepath.Join(matchDir, name)), zap.Error(err))
+				continue
+			}
+			removed++
+		}
+	}
+
+	if removed > 0 || failed > 0 {
+		logger.Info("completed stale download temp cleanup", zap.Int("removed", removed), zap.Int("failed", failed))
+	}
 }
 
 func (s *replayService) recoverPendingJobs() {
@@ -376,8 +436,16 @@ func (s *replayService) loadState() error {
 	}
 
 	records := map[string]*replayRecord{}
+	normalizedArtifacts := 0
 	for key, rec := range persisted.Records {
 		recCopy := rec
+		if recCopy.State == replayStateReady {
+			normalizedPath := s.resolveArtifactPath(recCopy.MatchID, recCopy.MapID, recCopy.ArtifactPath)
+			if normalizedPath != recCopy.ArtifactPath {
+				recCopy.ArtifactPath = normalizedPath
+				normalizedArtifacts++
+			}
+		}
 		records[key] = &recCopy
 	}
 
@@ -402,25 +470,82 @@ func (s *replayService) loadState() error {
 		queueOrder = append(queueOrder, trimmed)
 	}
 
+	processingDurations := make([]time.Duration, 0, len(persisted.ProcessingDurationsMS))
+	for _, durMS := range persisted.ProcessingDurationsMS {
+		if durMS <= 0 {
+			continue
+		}
+		processingDurations = append(processingDurations, time.Duration(durMS)*time.Millisecond)
+	}
+	if len(processingDurations) > recentProcessingWindowSize {
+		processingDurations = processingDurations[len(processingDurations)-recentProcessingWindowSize:]
+	}
+
 	s.mu.Lock()
 	s.records = records
 	s.latestMapByMatch = latest
 	s.seenEvents = seen
 	s.queueOrder = queueOrder
+	s.processingDurations = processingDurations
 	s.mu.Unlock()
 
 	logger.Info("loaded replay state", zap.Int("records", len(records)), zap.Int("seen_events", len(seen)))
+	if normalizedArtifacts > 0 {
+		logger.Info("normalized replay artifact paths from persisted state", zap.Int("normalized_records", normalizedArtifacts))
+		if err := s.persistState(); err != nil {
+			logger.Error("failed to persist normalized replay state", zap.Error(err))
+		}
+	}
 	return nil
+}
+
+func fileExists(path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return !info.IsDir()
+}
+
+func (s *replayService) resolveArtifactPath(matchID string, mapID string, artifactPath string) string {
+	trimmed := strings.TrimSpace(artifactPath)
+	if trimmed == "" {
+		return ""
+	}
+
+	if fileExists(trimmed) {
+		return trimmed
+	}
+
+	if !filepath.IsAbs(trimmed) {
+		joined := filepath.Join(s.replaysDir, trimmed)
+		if fileExists(joined) {
+			return joined
+		}
+	}
+
+	if strings.TrimSpace(matchID) != "" && strings.TrimSpace(mapID) != "" {
+		expected := filepath.Join(s.replaysDir, matchID, fmt.Sprintf("%s-%s.pbr.gz", matchID, mapID))
+		if fileExists(expected) {
+			return expected
+		}
+	}
+
+	return trimmed
 }
 
 func (s *replayService) persistState() error {
 	s.mu.RLock()
 	persisted := replayPersistentState{
-		Version:          1,
-		Records:          make(map[string]replayRecord, len(s.records)),
-		LatestMapByMatch: make(map[string]string, len(s.latestMapByMatch)),
-		SeenEvents:       make([]string, 0, len(s.seenEvents)),
-		QueueOrder:       make([]string, 0, len(s.queueOrder)),
+		Version:               1,
+		Records:               make(map[string]replayRecord, len(s.records)),
+		LatestMapByMatch:      make(map[string]string, len(s.latestMapByMatch)),
+		SeenEvents:            make([]string, 0, len(s.seenEvents)),
+		QueueOrder:            make([]string, 0, len(s.queueOrder)),
+		ProcessingDurationsMS: make([]int64, 0, len(s.processingDurations)),
 	}
 	for key, rec := range s.records {
 		persisted.Records[key] = *rec
@@ -432,6 +557,9 @@ func (s *replayService) persistState() error {
 		persisted.SeenEvents = append(persisted.SeenEvents, key)
 	}
 	persisted.QueueOrder = append(persisted.QueueOrder, s.queueOrder...)
+	for _, duration := range s.processingDurations {
+		persisted.ProcessingDurationsMS = append(persisted.ProcessingDurationsMS, duration.Milliseconds())
+	}
 	s.mu.RUnlock()
 
 	s.persistMu.Lock()
@@ -445,10 +573,15 @@ func (s *replayService) workerLoop(id int) {
 	for job := range s.queue {
 		s.mu.Lock()
 		s.removeFromQueueOrderLocked(replayRecordKey(job.MatchID, job.MapID))
+		s.activeParses++
 		s.mu.Unlock()
 		s.updateState(job.MatchID, job.MapID, replayStateParsing, "", "", "", job.EventID)
+		startedAt := time.Now().UTC()
 
 		if err := s.process(job); err != nil {
+			s.mu.Lock()
+			s.activeParses--
+			s.mu.Unlock()
 			logger.Error("replay processing failed",
 				zap.String("match_id", job.MatchID),
 				zap.String("map_id", job.MapID),
@@ -457,6 +590,11 @@ func (s *replayService) workerLoop(id int) {
 			s.updateState(job.MatchID, job.MapID, replayStateFailed, "", err.Error(), "", job.EventID)
 			continue
 		}
+
+		s.mu.Lock()
+		s.activeParses--
+		s.mu.Unlock()
+		s.recordProcessingDuration(time.Since(startedAt))
 	}
 }
 
@@ -472,6 +610,76 @@ func (s *replayService) queuePositionLocked(matchID string, mapID string, state 
 		}
 	}
 	return -1, total
+}
+
+func (s *replayService) recordProcessingDuration(duration time.Duration) {
+	if duration <= 0 {
+		return
+	}
+
+	s.mu.Lock()
+	s.processingDurations = append(s.processingDurations, duration)
+	if len(s.processingDurations) > recentProcessingWindowSize {
+		s.processingDurations = s.processingDurations[len(s.processingDurations)-recentProcessingWindowSize:]
+	}
+	s.mu.Unlock()
+
+	if err := s.persistState(); err != nil {
+		logger.Error("failed to persist replay state", zap.Error(err))
+	}
+}
+
+func (s *replayService) averageProcessingDurationLocked() (time.Duration, bool) {
+	if len(s.processingDurations) == 0 {
+		return 0, false
+	}
+
+	var total time.Duration
+	for _, duration := range s.processingDurations {
+		total += duration
+	}
+
+	return total / time.Duration(len(s.processingDurations)), true
+}
+
+func (s *replayService) etaMinutesLocked(state string, queuePosition int) (int, bool) {
+	avgDuration, ok := s.averageProcessingDurationLocked()
+	if !ok || avgDuration <= 0 {
+		return 0, false
+	}
+
+	workers := s.workerCount
+	if workers < 1 {
+		workers = 1
+	}
+
+	jobsUntilReady := 0
+	switch state {
+	case replayStateParsing:
+		jobsUntilReady = 1
+	case replayStateQueued:
+		if queuePosition < 1 {
+			return 0, false
+		}
+		jobsUntilReady = s.activeParses + queuePosition
+	default:
+		return 0, false
+	}
+
+	estimatedDuration := time.Duration(ceilDiv(jobsUntilReady, workers)) * avgDuration
+	estimatedMinutes := int((estimatedDuration + time.Minute - 1) / time.Minute)
+	if estimatedMinutes < 1 {
+		estimatedMinutes = 1
+	}
+
+	return estimatedMinutes, true
+}
+
+func ceilDiv(n int, d int) int {
+	if d <= 0 {
+		return 0
+	}
+	return (n + d - 1) / d
 }
 
 func (s *replayService) hasQueueKeyLocked(key string) bool {
@@ -500,10 +708,29 @@ func (s *replayService) removeFromQueueOrderLocked(key string) {
 	}
 }
 
+func (s *replayService) removeSeenEventsLocked(matchID string, mapID string) int {
+	suffix := "::" + matchID + "::" + mapID
+	removed := 0
+	for key := range s.seenEvents {
+		if !strings.HasSuffix(key, suffix) {
+			continue
+		}
+		delete(s.seenEvents, key)
+		removed++
+	}
+	return removed
+}
+
 func (s *replayService) process(job replayWork) error {
 	secureURL, err := s.resolveDemoDownloadURL(job.DemoURL)
 	if err != nil {
 		return fmt.Errorf("invalid demo url: %w", err)
+	}
+	parseFilename := filepath.Base(secureURL)
+	if parsedURL, parseErr := url.Parse(secureURL); parseErr == nil {
+		if base := filepath.Base(parsedURL.Path); strings.TrimSpace(base) != "" && base != "." && base != "/" {
+			parseFilename = base
+		}
 	}
 
 	matchDir := filepath.Join(s.replaysDir, job.MatchID)
@@ -534,7 +761,13 @@ func (s *replayService) process(job replayWork) error {
 	if err != nil {
 		return err
 	}
+	if size < minDownloadedDemoBytes {
+		return fmt.Errorf("downloaded demo too small: %d bytes", size)
+	}
 	if err := tmpFile.Sync(); err != nil {
+		return err
+	}
+	if err := validateDemoFilestamp(tmpFile, parseFilename); err != nil {
 		return err
 	}
 
@@ -559,7 +792,7 @@ func (s *replayService) process(job replayWork) error {
 	reducedSizeBytes := int64(0)
 	var callbackErr error
 
-	parseErr := pparser.WasmParseDemo(filepath.Base(secureURL), tmpFile, func(payload []byte) {
+	parseErr := pparser.WasmParseDemo(parseFilename, tmpFile, func(payload []byte) {
 		if callbackErr != nil {
 			return
 		}
@@ -642,6 +875,77 @@ func (s *replayService) process(job replayWork) error {
 		zap.Int64("artifact_size_bytes", artifactInfo.Size()))
 
 	s.updateState(job.MatchID, job.MapID, replayStateReady, artifactPath, "", secureURL, job.EventID)
+	return nil
+}
+
+type demoReadCloser struct {
+	reader  io.Reader
+	closeFn func() error
+}
+
+func (d *demoReadCloser) Read(p []byte) (int, error) {
+	return d.reader.Read(p)
+}
+
+func (d *demoReadCloser) Close() error {
+	if d.closeFn == nil {
+		return nil
+	}
+	return d.closeFn()
+}
+
+func openDemoStream(filename string, src *os.File) (io.ReadCloser, error) {
+	if strings.HasSuffix(filename, ".gz") {
+		r, err := gzip.NewReader(src)
+		if err != nil {
+			return nil, err
+		}
+		return r, nil
+	}
+
+	if strings.HasSuffix(filename, ".zst") {
+		r, err := zstd.NewReader(src)
+		if err != nil {
+			return nil, err
+		}
+		return r.IOReadCloser(), nil
+	}
+
+	if strings.HasSuffix(filename, ".bz2") {
+		return &demoReadCloser{reader: bzip2.NewReader(src)}, nil
+	}
+
+	if strings.HasSuffix(filename, ".dem") {
+		return &demoReadCloser{reader: src}, nil
+	}
+
+	return nil, fmt.Errorf("unsupported file format %s", filename)
+}
+
+func validateDemoFilestamp(file *os.File, filename string) error {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+
+	r, err := openDemoStream(filename, file)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	stamp := make([]byte, 8)
+	if _, err := io.ReadFull(r, stamp); err != nil {
+		return fmt.Errorf("failed to read demo filestamp: %w", err)
+	}
+
+	if !bytes.HasPrefix(stamp, []byte("PBDEMS2")) {
+		return fmt.Errorf("invalid demo filestamp %q", string(stamp))
+	}
+
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -921,10 +1225,32 @@ func (s *replayService) handleReplayStatus(w http.ResponseWriter, _ *http.Reques
 	rec, ok := s.getLocked(matchID, mapID)
 	mapIDs := s.mapIDsLocked(matchID)
 	queuePosition, queueTotal := -1, 0
+	etaMinutes := -1
 	if ok {
 		queuePosition, queueTotal = s.queuePositionLocked(rec.MatchID, rec.MapID, rec.State)
+		if estimatedMinutes, hasETA := s.etaMinutesLocked(rec.State, queuePosition); hasETA {
+			etaMinutes = estimatedMinutes
+		}
 	}
 	s.mu.RUnlock()
+	if !ok {
+		if recovered, err := s.recoverMatchRecordsFromDisk(matchID); err != nil {
+			logger.Error("failed to recover replay records from disk", zap.String("match_id", matchID), zap.Error(err))
+		} else if recovered {
+			s.mu.RLock()
+			rec, ok = s.getLocked(matchID, mapID)
+			mapIDs = s.mapIDsLocked(matchID)
+			queuePosition, queueTotal = -1, 0
+			etaMinutes = -1
+			if ok {
+				queuePosition, queueTotal = s.queuePositionLocked(rec.MatchID, rec.MapID, rec.State)
+				if estimatedMinutes, hasETA := s.etaMinutesLocked(rec.State, queuePosition); hasETA {
+					etaMinutes = estimatedMinutes
+				}
+			}
+			s.mu.RUnlock()
+		}
+	}
 	if !ok {
 		resp := map[string]any{
 			"match_id": matchID,
@@ -937,25 +1263,28 @@ func (s *replayService) handleReplayStatus(w http.ResponseWriter, _ *http.Reques
 	}
 
 	resp := map[string]any{
-		"match_id":            rec.MatchID,
-		"map_id":              rec.MapID,
-		"match_instance_id":   rec.MatchInstanceID,
-		"state":               rec.State,
-		"artifact_path":       rec.ArtifactPath,
-		"demo_url":            rec.DemoURL,
-		"last_error":          rec.LastError,
-		"last_event_id":       rec.LastEventID,
-		"last_transaction_id": rec.LastTransactionID,
-		"last_updated_at":     rec.LastUpdatedAt,
-		"created_at":          rec.CreatedAt,
+		"match_id":              rec.MatchID,
+		"map_id":                rec.MapID,
+		"match_instance_id":     rec.MatchInstanceID,
+		"state":                 rec.State,
+		"artifact_path":         rec.ArtifactPath,
+		"demo_url":              rec.DemoURL,
+		"last_error":            rec.LastError,
+		"last_event_id":         rec.LastEventID,
+		"last_transaction_id":   rec.LastTransactionID,
+		"last_updated_at":       rec.LastUpdatedAt,
+		"created_at":            rec.CreatedAt,
 		"last_webhook_event_at": rec.LastWebhookEventAt,
-		"map_ids":             mapIDs,
+		"map_ids":               mapIDs,
 	}
 	if rec.State == replayStateQueued || rec.State == replayStateParsing {
 		if queuePosition >= 0 {
 			resp["queue_position"] = queuePosition
 		}
 		resp["queue_total"] = queueTotal
+		if etaMinutes >= 0 {
+			resp["eta_minutes"] = etaMinutes
+		}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -964,6 +1293,15 @@ func (s *replayService) handleReplayFetch(w http.ResponseWriter, r *http.Request
 	s.mu.RLock()
 	rec, ok := s.getLocked(matchID, mapID)
 	s.mu.RUnlock()
+	if !ok {
+		if recovered, err := s.recoverMatchRecordsFromDisk(matchID); err != nil {
+			logger.Error("failed to recover replay records from disk", zap.String("match_id", matchID), zap.Error(err))
+		} else if recovered {
+			s.mu.RLock()
+			rec, ok = s.getLocked(matchID, mapID)
+			s.mu.RUnlock()
+		}
+	}
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]any{
 			"match_id": matchID,
@@ -975,6 +1313,7 @@ func (s *replayService) handleReplayFetch(w http.ResponseWriter, r *http.Request
 	if rec.State != replayStateReady || rec.ArtifactPath == "" {
 		s.mu.RLock()
 		queuePosition, queueTotal := s.queuePositionLocked(rec.MatchID, rec.MapID, rec.State)
+		etaMinutes, hasETA := s.etaMinutesLocked(rec.State, queuePosition)
 		s.mu.RUnlock()
 		resp := map[string]any{
 			"match_id": rec.MatchID,
@@ -987,8 +1326,44 @@ func (s *replayService) handleReplayFetch(w http.ResponseWriter, r *http.Request
 				resp["queue_position"] = queuePosition
 			}
 			resp["queue_total"] = queueTotal
+			if hasETA {
+				resp["eta_minutes"] = etaMinutes
+			}
 		}
 		writeJSON(w, http.StatusAccepted, resp)
+		return
+	}
+
+	resolvedArtifactPath := s.resolveArtifactPath(rec.MatchID, rec.MapID, rec.ArtifactPath)
+	if resolvedArtifactPath != rec.ArtifactPath {
+		s.mu.Lock()
+		if current, found := s.records[replayRecordKey(rec.MatchID, rec.MapID)]; found {
+			current.ArtifactPath = resolvedArtifactPath
+			current.LastUpdatedAt = time.Now().UTC()
+			rec = current
+		}
+		s.mu.Unlock()
+		if err := s.persistState(); err != nil {
+			logger.Error("failed to persist replay state", zap.Error(err))
+		}
+	}
+
+	if !fileExists(rec.ArtifactPath) {
+		if recovered, err := s.recoverMatchRecordsFromDisk(rec.MatchID); err != nil {
+			logger.Error("failed to recover replay records from disk", zap.String("match_id", rec.MatchID), zap.Error(err))
+		} else if recovered {
+			s.mu.RLock()
+			rec, ok = s.getLocked(matchID, mapID)
+			s.mu.RUnlock()
+		}
+	}
+
+	if !ok || rec.State != replayStateReady || rec.ArtifactPath == "" || !fileExists(rec.ArtifactPath) {
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"match_id": matchID,
+			"map_id":   mapID,
+			"state":    replayStateMissing,
+		})
 		return
 	}
 
@@ -997,6 +1372,118 @@ func (s *replayService) handleReplayFetch(w http.ResponseWriter, r *http.Request
 	w.Header().Set("X-Replay-Map-Id", rec.MapID)
 	w.Header().Set("Cache-Control", "public, max-age=300")
 	http.ServeFile(w, r, rec.ArtifactPath)
+}
+
+func chooseLatestMapID(mapIDs []string) string {
+	if len(mapIDs) == 0 {
+		return ""
+	}
+	copied := append([]string(nil), mapIDs...)
+	sort.Slice(copied, func(i, j int) bool {
+		leftNum, leftErr := strconv.Atoi(copied[i])
+		rightNum, rightErr := strconv.Atoi(copied[j])
+		if leftErr == nil && rightErr == nil {
+			return leftNum < rightNum
+		}
+		if leftErr == nil {
+			return false
+		}
+		if rightErr == nil {
+			return true
+		}
+		return copied[i] < copied[j]
+	})
+	return copied[len(copied)-1]
+}
+
+func (s *replayService) discoverArtifacts(matchID string) (map[string]string, error) {
+	matchDir := filepath.Join(s.replaysDir, matchID)
+	entries, err := os.ReadDir(matchDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	artifacts := make(map[string]string)
+	prefix := matchID + "-"
+	suffix := ".pbr.gz"
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
+			continue
+		}
+		mapID := strings.TrimSuffix(strings.TrimPrefix(name, prefix), suffix)
+		if strings.TrimSpace(mapID) == "" {
+			continue
+		}
+		artifacts[mapID] = filepath.Join(matchDir, name)
+	}
+
+	return artifacts, nil
+}
+
+func (s *replayService) recoverMatchRecordsFromDisk(matchID string) (bool, error) {
+	artifacts, err := s.discoverArtifacts(matchID)
+	if err != nil {
+		return false, err
+	}
+	if len(artifacts) == 0 {
+		return false, nil
+	}
+
+	now := time.Now().UTC()
+	mapIDs := make([]string, 0, len(artifacts))
+
+	s.mu.Lock()
+	changed := false
+	for mapID, artifactPath := range artifacts {
+		mapIDs = append(mapIDs, mapID)
+		key := replayRecordKey(matchID, mapID)
+		rec, exists := s.records[key]
+		if !exists {
+			rec = &replayRecord{
+				MatchID:       matchID,
+				MapID:         mapID,
+				CreatedAt:     now,
+				LastUpdatedAt: now,
+			}
+			s.records[key] = rec
+			changed = true
+		}
+		if rec.State != replayStateReady {
+			rec.State = replayStateReady
+			changed = true
+		}
+		if rec.ArtifactPath != artifactPath {
+			rec.ArtifactPath = artifactPath
+			changed = true
+		}
+		if rec.LastError != "" {
+			rec.LastError = ""
+			changed = true
+		}
+		rec.LastUpdatedAt = now
+	}
+	if latest := chooseLatestMapID(mapIDs); latest != "" {
+		if s.latestMapByMatch[matchID] != latest {
+			s.latestMapByMatch[matchID] = latest
+			changed = true
+		}
+	}
+	s.mu.Unlock()
+
+	if changed {
+		if err := s.persistState(); err != nil {
+			return true, err
+		}
+	}
+
+	return true, nil
 }
 
 func (s *replayService) adminReprocessHandler(w http.ResponseWriter, r *http.Request) {
@@ -1026,23 +1513,221 @@ func (s *replayService) adminReprocessHandler(w http.ResponseWriter, r *http.Req
 	if mapID == "" {
 		mapID = "manual"
 	}
-
-	s.updateState(req.MatchID, mapID, replayStateQueued, "", "", req.DemoURL, "manual")
-	select {
-	case s.queue <- replayWork{
+	job := replayWork{
 		EventID:   "manual-" + strconv.FormatInt(time.Now().UnixNano(), 10),
 		MatchID:   req.MatchID,
 		MapID:     mapID,
 		DemoURL:   req.DemoURL,
 		Timestamp: time.Now().UTC(),
-	}:
-		writeJSON(w, http.StatusAccepted, map[string]string{
-			"match_id": req.MatchID,
-			"map_id":   mapID,
-			"state":    replayStateQueued,
-		})
-	default:
+	}
+
+	if !s.enqueueAdminReplayJob(job, "manual") {
 		http.Error(w, "ingest queue is full", http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		"match_id": req.MatchID,
+		"map_id":   mapID,
+		"state":    replayStateQueued,
+	})
+}
+
+func (s *replayService) adminReprocessFailedHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.adminAuthorized(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var req struct {
+		MatchID string `json:"match_id"`
+		MapID   string `json:"map_id"`
+		Limit   int    `json:"limit"`
+		DryRun  bool   `json:"dry_run"`
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024))
+	if err := decoder.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		http.Error(w, "invalid json payload", http.StatusBadRequest)
+		return
+	}
+	if req.Limit < 0 {
+		http.Error(w, "limit must be >= 0", http.StatusBadRequest)
+		return
+	}
+	matchID := strings.TrimSpace(req.MatchID)
+	mapID := strings.TrimSpace(req.MapID)
+
+	type candidate struct {
+		job           replayWork
+		transactionID string
+	}
+	candidates := make([]candidate, 0)
+	scannedFailed := 0
+	skippedNoDemoURL := 0
+
+	s.mu.RLock()
+	for _, rec := range s.records {
+		if rec.State != replayStateFailed {
+			continue
+		}
+		scannedFailed++
+		if matchID != "" && rec.MatchID != matchID {
+			continue
+		}
+		if mapID != "" && rec.MapID != mapID {
+			continue
+		}
+		if strings.TrimSpace(rec.DemoURL) == "" {
+			skippedNoDemoURL++
+			continue
+		}
+		candidates = append(candidates, candidate{
+			job: replayWork{
+				EventID:         "admin-reprocess-failed-" + strconv.FormatInt(time.Now().UnixNano(), 10),
+				MatchID:         rec.MatchID,
+				MapID:           rec.MapID,
+				MatchInstanceID: rec.MatchInstanceID,
+				DemoURL:         rec.DemoURL,
+				Timestamp:       time.Now().UTC(),
+			},
+			transactionID: rec.LastTransactionID,
+		})
+	}
+	s.mu.RUnlock()
+
+	matched := len(candidates)
+	if req.Limit > 0 && len(candidates) > req.Limit {
+		candidates = candidates[:req.Limit]
+	}
+	selected := len(candidates)
+
+	if req.DryRun {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"dry_run":             true,
+			"failed_scanned":      scannedFailed,
+			"failed_matched":      matched,
+			"failed_selected":     selected,
+			"queued":              0,
+			"queue_full":          0,
+			"skipped_no_demo_url": skippedNoDemoURL,
+		})
+		return
+	}
+
+	queued := 0
+	queueFull := 0
+	for _, c := range candidates {
+		if s.enqueueAdminReplayJob(c.job, c.transactionID) {
+			queued++
+			continue
+		}
+		queueFull++
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"dry_run":             false,
+		"failed_scanned":      scannedFailed,
+		"failed_matched":      matched,
+		"failed_selected":     selected,
+		"queued":              queued,
+		"queue_full":          queueFull,
+		"skipped_no_demo_url": skippedNoDemoURL,
+	})
+}
+
+func (s *replayService) adminDeleteReplayHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.adminAuthorized(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var req struct {
+		MatchID string `json:"match_id"`
+		MapID   string `json:"map_id"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
+		http.Error(w, "invalid json payload", http.StatusBadRequest)
+		return
+	}
+	matchID := strings.TrimSpace(req.MatchID)
+	mapID := strings.TrimSpace(req.MapID)
+	if matchID == "" || mapID == "" {
+		http.Error(w, "match_id and map_id are required", http.StatusBadRequest)
+		return
+	}
+
+	key := replayRecordKey(matchID, mapID)
+
+	s.mu.Lock()
+	rec, exists := s.records[key]
+	if !exists {
+		s.mu.Unlock()
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"match_id": matchID,
+			"map_id":   mapID,
+			"deleted":  false,
+			"error":    "replay record not found",
+		})
+		return
+	}
+	delete(s.records, key)
+	s.removeFromQueueOrderLocked(key)
+	removedSeenEvents := s.removeSeenEventsLocked(matchID, mapID)
+	if latest := chooseLatestMapID(s.mapIDsLocked(matchID)); latest != "" {
+		s.latestMapByMatch[matchID] = latest
+	} else {
+		delete(s.latestMapByMatch, matchID)
+	}
+	deletedState := rec.State
+	s.mu.Unlock()
+
+	if err := s.persistState(); err != nil {
+		logger.Error("failed to persist replay state", zap.Error(err))
+		http.Error(w, "failed to persist state", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"match_id":            matchID,
+		"map_id":              mapID,
+		"deleted":             true,
+		"previous_state":      deletedState,
+		"removed_seen_events": removedSeenEvents,
+	})
+}
+
+func (s *replayService) enqueueAdminReplayJob(job replayWork, transactionID string) bool {
+	select {
+	case s.queue <- job:
+		now := time.Now().UTC()
+		s.mu.Lock()
+		rec := s.getOrCreateLocked(job.MatchID, job.MapID)
+		rec.MatchID = job.MatchID
+		rec.MapID = job.MapID
+		rec.MatchInstanceID = job.MatchInstanceID
+		rec.DemoURL = job.DemoURL
+		rec.LastEventID = job.EventID
+		rec.LastTransactionID = transactionID
+		rec.LastWebhookEventAt = job.Timestamp
+		rec.LastError = ""
+		rec.State = replayStateQueued
+		rec.LastUpdatedAt = now
+		s.appendQueueOrderLocked(replayRecordKey(job.MatchID, job.MapID))
+		s.latestMapByMatch[job.MatchID] = job.MapID
+		s.mu.Unlock()
+		if err := s.persistState(); err != nil {
+			logger.Error("failed to persist replay state", zap.Error(err))
+		}
+		return true
+	default:
+		return false
 	}
 }
 

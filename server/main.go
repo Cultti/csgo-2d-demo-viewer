@@ -66,6 +66,8 @@ func main() {
 	http.HandleFunc("/webhooks/faceit/demo-ready", replay.webhookDemoReadyHandler)
 	http.HandleFunc("/replays/", replay.replaysHandler)
 	http.HandleFunc("/admin/replays/reprocess", replay.adminReprocessHandler)
+	http.HandleFunc("/admin/replays/reprocess-failed", replay.adminReprocessFailedHandler)
+	http.HandleFunc("/admin/replays/delete", replay.adminDeleteReplayHandler)
 	http.Handle("/", spaHandler(*webDir))
 
 	if *dev {

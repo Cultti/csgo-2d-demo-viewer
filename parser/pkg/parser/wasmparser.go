@@ -7,6 +7,7 @@ import (
 	"csgo-2d-demo-player/pkg/message"
 	"fmt"
 	"io"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -16,7 +17,13 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func WasmParseDemo(demoFilename string, demoFile io.Reader, callback func(payload []byte)) error {
+func WasmParseDemo(demoFilename string, demoFile io.Reader, callback func(payload []byte)) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic while parsing demo: %v\nstacktrace:\n%s", r, string(debug.Stack()))
+		}
+	}()
+
 	stopwatch := time.Now()
 	log.L().Debug("starting decompressing the demo", zap.String("demo file", demoFilename))
 	decompressedDemo, decompressErr := decompress(demoFilename, demoFile)

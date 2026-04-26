@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -587,6 +588,8 @@ func TestReplayStatusIncludesQueuePosition(t *testing.T) {
 		latestMapByMatch: map[string]string{},
 		seenEvents:       map[string]struct{}{},
 		queueOrder:       []string{replayRecordKey("demo-1", "1"), replayRecordKey("demo-1", "2"), replayRecordKey("demo-1", "3")},
+		workerCount:      1,
+		processingDurations: []time.Duration{time.Minute},
 		queue:            make(chan replayWork, 3),
 	}
 
@@ -615,5 +618,467 @@ func TestReplayStatusIncludesQueuePosition(t *testing.T) {
 	}
 	if got := int(payload["queue_total"].(float64)); got != 3 {
 		t.Fatalf("expected queue_total 3, got %d", got)
+	}
+	if got := int(payload["eta_minutes"].(float64)); got != 2 {
+		t.Fatalf("expected eta_minutes 2, got %d", got)
+	}
+}
+
+func TestReplayFetchPendingIncludesQueueETA(t *testing.T) {
+	logger = zap.NewNop()
+	now := time.Now().UTC()
+	svc := &replayService{
+		records: map[string]*replayRecord{
+			replayRecordKey("demo-1", "2"): {
+				MatchID:       "demo-1",
+				MapID:         "2",
+				State:         replayStateQueued,
+				CreatedAt:     now,
+				LastUpdatedAt: now,
+			},
+		},
+		latestMapByMatch: map[string]string{"demo-1": "2"},
+		seenEvents:       map[string]struct{}{},
+		queueOrder:       []string{replayRecordKey("demo-1", "2")},
+		activeParses:     1,
+		workerCount:      1,
+		processingDurations: []time.Duration{2 * time.Minute},
+		queue:            make(chan replayWork, 2),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/replays/demo-1?map_id=2", nil)
+	rr := httptest.NewRecorder()
+	svc.replaysHandler(rr, req)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 for queued replay fetch, got %d", rr.Code)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("failed to decode fetch json: %v", err)
+	}
+	if got := int(payload["queue_position"].(float64)); got != 1 {
+		t.Fatalf("expected queue_position 1, got %d", got)
+	}
+	if got := int(payload["queue_total"].(float64)); got != 1 {
+		t.Fatalf("expected queue_total 1, got %d", got)
+	}
+	if got := int(payload["eta_minutes"].(float64)); got != 4 {
+		t.Fatalf("expected eta_minutes 4, got %d", got)
+	}
+}
+
+func TestReplayStatusRecoversFromArtifactsOnDisk(t *testing.T) {
+	logger = zap.NewNop()
+	replaysDir := t.TempDir()
+	matchID := "1-5000aa78-482d-4032-a354-64cb1ded384d"
+	matchDir := filepath.Join(replaysDir, matchID)
+	if err := os.MkdirAll(matchDir, 0o755); err != nil {
+		t.Fatalf("failed to create match directory: %v", err)
+	}
+	artifactPath := filepath.Join(matchDir, matchID+"-1.pbr.gz")
+	if err := os.WriteFile(artifactPath, []byte("artifact"), 0o644); err != nil {
+		t.Fatalf("failed to create artifact: %v", err)
+	}
+
+	svc := &replayService{
+		records:          map[string]*replayRecord{},
+		latestMapByMatch: map[string]string{},
+		seenEvents:       map[string]struct{}{},
+		queueOrder:       []string{},
+		queue:            make(chan replayWork, 1),
+		replaysDir:        replaysDir,
+		stateFile:         filepath.Join(replaysDir, "replay_state.json"),
+	}
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/replays/"+matchID+"/status?map_id=1", nil)
+	statusRes := httptest.NewRecorder()
+	svc.replaysHandler(statusRes, statusReq)
+	if statusRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 for recovered replay, got %d body=%s", statusRes.Code, statusRes.Body.String())
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(statusRes.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("failed to decode status json: %v", err)
+	}
+	if payload["state"] != replayStateReady {
+		t.Fatalf("expected ready state after disk recovery, got %v", payload["state"])
+	}
+}
+
+func TestReplayStatusAndFetchMissingWhenRequestedMapMissing(t *testing.T) {
+	logger = zap.NewNop()
+	replaysDir := t.TempDir()
+	matchID := "1-5000aa78-482d-4032-a354-64cb1ded384d"
+	matchDir := filepath.Join(replaysDir, matchID)
+	if err := os.MkdirAll(matchDir, 0o755); err != nil {
+		t.Fatalf("failed to create match directory: %v", err)
+	}
+	artifactMap1 := filepath.Join(matchDir, matchID+"-1.pbr.gz")
+	artifactMap2 := filepath.Join(matchDir, matchID+"-2.pbr.gz")
+	if err := os.WriteFile(artifactMap1, []byte("map1"), 0o644); err != nil {
+		t.Fatalf("failed to create map1 artifact: %v", err)
+	}
+	if err := os.WriteFile(artifactMap2, []byte("map2"), 0o644); err != nil {
+		t.Fatalf("failed to create map2 artifact: %v", err)
+	}
+
+	svc := &replayService{
+		records:          map[string]*replayRecord{},
+		latestMapByMatch: map[string]string{},
+		seenEvents:       map[string]struct{}{},
+		queueOrder:       []string{},
+		queue:            make(chan replayWork, 1),
+		replaysDir:        replaysDir,
+		stateFile:         filepath.Join(replaysDir, "replay_state.json"),
+	}
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/replays/"+matchID+"/status?map_id=9", nil)
+	statusRes := httptest.NewRecorder()
+	svc.replaysHandler(statusRes, statusReq)
+	if statusRes.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 when requested map is missing, got %d body=%s", statusRes.Code, statusRes.Body.String())
+	}
+
+	var statusPayload map[string]any
+	if err := json.Unmarshal(statusRes.Body.Bytes(), &statusPayload); err != nil {
+		t.Fatalf("failed to decode status json: %v", err)
+	}
+	if statusPayload["state"] != replayStateMissing {
+		t.Fatalf("expected missing state for missing requested map, got %v", statusPayload["state"])
+	}
+	if statusPayload["map_id"] != "9" {
+		t.Fatalf("expected response map_id 9, got %v", statusPayload["map_id"])
+	}
+
+	fetchReq := httptest.NewRequest(http.MethodGet, "/replays/"+matchID+"?map_id=9", nil)
+	fetchRes := httptest.NewRecorder()
+	svc.replaysHandler(fetchRes, fetchReq)
+	if fetchRes.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 fetch when requested map is missing, got %d body=%s", fetchRes.Code, fetchRes.Body.String())
+	}
+}
+
+func TestLoadStateNormalizesReadyArtifactPath(t *testing.T) {
+	logger = zap.NewNop()
+	replaysDir := t.TempDir()
+	t.Setenv("REPLAYS_DIR", replaysDir)
+
+	matchID := "1-4d45d071-c885-4268-80c9-4a2f95eb3d2c"
+	mapID := "2"
+	matchDir := filepath.Join(replaysDir, matchID)
+	if err := os.MkdirAll(matchDir, 0o755); err != nil {
+		t.Fatalf("failed to create match directory: %v", err)
+	}
+	expectedArtifact := filepath.Join(matchDir, matchID+"-"+mapID+".pbr.gz")
+	if err := os.WriteFile(expectedArtifact, []byte("artifact"), 0o644); err != nil {
+		t.Fatalf("failed to create artifact: %v", err)
+	}
+
+	persisted := replayPersistentState{
+		Version:          1,
+		Records:          map[string]replayRecord{},
+		LatestMapByMatch: map[string]string{matchID: mapID},
+		SeenEvents:       []string{},
+		QueueOrder:       []string{},
+	}
+	persisted.Records[replayRecordKey(matchID, mapID)] = replayRecord{
+		MatchID:      matchID,
+		MapID:        mapID,
+		State:        replayStateReady,
+		ArtifactPath: filepath.Join("parsed", matchID, matchID+"-"+mapID+".pbr.gz"),
+	}
+	stateBytes, err := json.Marshal(persisted)
+	if err != nil {
+		t.Fatalf("failed to marshal persisted state: %v", err)
+	}
+	stateFile := filepath.Join(replaysDir, "replay_state.json")
+	if err := os.WriteFile(stateFile, stateBytes, 0o644); err != nil {
+		t.Fatalf("failed to write persisted state: %v", err)
+	}
+
+	svc, err := newReplayService()
+	if err != nil {
+		t.Fatalf("newReplayService failed: %v", err)
+	}
+
+	svc.mu.RLock()
+	rec, ok := svc.records[replayRecordKey(matchID, mapID)]
+	svc.mu.RUnlock()
+	if !ok {
+		t.Fatalf("expected replay record to be loaded")
+	}
+	if rec.ArtifactPath != expectedArtifact {
+		t.Fatalf("expected normalized artifact path %q, got %q", expectedArtifact, rec.ArtifactPath)
+	}
+}
+
+func TestReplayFetchRecoversWhenRecordArtifactPathIsStale(t *testing.T) {
+	logger = zap.NewNop()
+	replaysDir := t.TempDir()
+	matchID := "1-4d45d071-c885-4268-80c9-4a2f95eb3d2c"
+	mapID := "2"
+	matchDir := filepath.Join(replaysDir, matchID)
+	if err := os.MkdirAll(matchDir, 0o755); err != nil {
+		t.Fatalf("failed to create match directory: %v", err)
+	}
+	artifactPath := filepath.Join(matchDir, matchID+"-"+mapID+".pbr.gz")
+	if err := os.WriteFile(artifactPath, []byte("recovered"), 0o644); err != nil {
+		t.Fatalf("failed to create artifact: %v", err)
+	}
+
+	svc := &replayService{
+		records: map[string]*replayRecord{
+			replayRecordKey(matchID, mapID): {
+				MatchID:      matchID,
+				MapID:        mapID,
+				State:        replayStateReady,
+				ArtifactPath: filepath.Join("parsed", matchID, matchID+"-"+mapID+".pbr.gz"),
+			},
+		},
+		latestMapByMatch: map[string]string{matchID: mapID},
+		seenEvents:       map[string]struct{}{},
+		queueOrder:       []string{},
+		queue:            make(chan replayWork, 1),
+		replaysDir:        replaysDir,
+		stateFile:         filepath.Join(replaysDir, "replay_state.json"),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/replays/"+matchID+"?map_id="+mapID, nil)
+	rr := httptest.NewRecorder()
+	svc.replaysHandler(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 after stale path recovery, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if rr.Body.String() != "recovered" {
+		t.Fatalf("expected recovered artifact body, got %q", rr.Body.String())
+	}
+}
+
+func TestCleanupStaleDownloadTempFiles(t *testing.T) {
+	logger = zap.NewNop()
+	replaysDir := t.TempDir()
+	matchID := "1-e64dfef6-b61b-449e-8d98-f12ceefbba6c"
+	matchDir := filepath.Join(replaysDir, matchID)
+	if err := os.MkdirAll(matchDir, 0o755); err != nil {
+		t.Fatalf("failed to create match directory: %v", err)
+	}
+
+	staleTemp := filepath.Join(matchDir, "download-1528820945.dem.zst")
+	replayArtifact := filepath.Join(matchDir, matchID+"-1.pbr.gz")
+	metaFile := filepath.Join(matchDir, "metadata.json")
+
+	if err := os.WriteFile(staleTemp, []byte("tmp"), 0o644); err != nil {
+		t.Fatalf("failed to create stale temp file: %v", err)
+	}
+	if err := os.WriteFile(replayArtifact, []byte("artifact"), 0o644); err != nil {
+		t.Fatalf("failed to create replay artifact file: %v", err)
+	}
+	if err := os.WriteFile(metaFile, []byte(`{"ok":true}`), 0o644); err != nil {
+		t.Fatalf("failed to create metadata file: %v", err)
+	}
+
+	svc := &replayService{replaysDir: replaysDir}
+	svc.cleanupStaleDownloadTempFiles()
+
+	if _, err := os.Stat(staleTemp); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected stale temp file to be removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(replayArtifact); err != nil {
+		t.Fatalf("expected replay artifact to be kept, stat err=%v", err)
+	}
+	if _, err := os.Stat(metaFile); err != nil {
+		t.Fatalf("expected metadata file to be kept, stat err=%v", err)
+	}
+}
+
+func TestAdminReprocessFailedRequiresAuth(t *testing.T) {
+	logger = zap.NewNop()
+	svc := &replayService{}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/replays/reprocess-failed", bytes.NewReader([]byte(`{}`)))
+	rr := httptest.NewRecorder()
+	svc.adminReprocessFailedHandler(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without admin token, got %d", rr.Code)
+	}
+}
+
+func TestAdminReprocessFailedDryRunAndQueue(t *testing.T) {
+	logger = zap.NewNop()
+	now := time.Now().UTC()
+	svc := &replayService{
+		records: map[string]*replayRecord{
+			replayRecordKey("m-1", "1"): {
+				MatchID:       "m-1",
+				MapID:         "1",
+				State:         replayStateFailed,
+				DemoURL:       "https://pappa.aukko.net/demos/m-1-1.dem.zst",
+				LastError:     "parse failed",
+				LastUpdatedAt: now,
+				CreatedAt:     now,
+			},
+			replayRecordKey("m-1", "2"): {
+				MatchID:       "m-1",
+				MapID:         "2",
+				State:         replayStateFailed,
+				DemoURL:       "",
+				LastError:     "missing demo",
+				LastUpdatedAt: now,
+				CreatedAt:     now,
+			},
+			replayRecordKey("m-1", "3"): {
+				MatchID:       "m-1",
+				MapID:         "3",
+				State:         replayStateReady,
+				DemoURL:       "https://pappa.aukko.net/demos/m-1-3.dem.zst",
+				LastUpdatedAt: now,
+				CreatedAt:     now,
+			},
+			replayRecordKey("m-2", "1"): {
+				MatchID:       "m-2",
+				MapID:         "1",
+				State:         replayStateFailed,
+				DemoURL:       "https://pappa.aukko.net/demos/m-2-1.dem.zst",
+				LastUpdatedAt: now,
+				CreatedAt:     now,
+			},
+		},
+		latestMapByMatch: map[string]string{"m-1": "3", "m-2": "1"},
+		seenEvents:       map[string]struct{}{},
+		queueOrder:       []string{},
+		queue:            make(chan replayWork, 10),
+		stateFile:        filepath.Join(t.TempDir(), "replay_state.json"),
+		adminToken:       "token",
+	}
+
+	dryRunReq := httptest.NewRequest(http.MethodPost, "/admin/replays/reprocess-failed", bytes.NewReader([]byte(`{"match_id":"m-1","dry_run":true}`)))
+	dryRunReq.Header.Set("X-Admin-Token", "token")
+	dryRunRes := httptest.NewRecorder()
+	svc.adminReprocessFailedHandler(dryRunRes, dryRunReq)
+	if dryRunRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 for dry run, got %d body=%s", dryRunRes.Code, dryRunRes.Body.String())
+	}
+	if qLen := len(svc.queue); qLen != 0 {
+		t.Fatalf("expected no queue changes on dry run, got len=%d", qLen)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/replays/reprocess-failed", bytes.NewReader([]byte(`{"match_id":"m-1"}`)))
+	req.Header.Set("X-Admin-Token", "token")
+	res := httptest.NewRecorder()
+	svc.adminReprocessFailedHandler(res, req)
+	if res.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 for bulk reprocess, got %d body=%s", res.Code, res.Body.String())
+	}
+	if qLen := len(svc.queue); qLen != 1 {
+		t.Fatalf("expected one queued failed replay with demo_url, got len=%d", qLen)
+	}
+
+	svc.mu.RLock()
+	rec1 := svc.records[replayRecordKey("m-1", "1")]
+	rec2 := svc.records[replayRecordKey("m-1", "2")]
+	svc.mu.RUnlock()
+	if rec1.State != replayStateQueued {
+		t.Fatalf("expected m-1 map 1 to become queued, got %s", rec1.State)
+	}
+	if rec2.State != replayStateFailed {
+		t.Fatalf("expected m-1 map 2 to remain failed (missing demo_url), got %s", rec2.State)
+	}
+}
+
+func TestAdminDeleteReplayRequiresAuth(t *testing.T) {
+	logger = zap.NewNop()
+	svc := &replayService{}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/replays/delete", bytes.NewReader([]byte(`{"match_id":"m-1","map_id":"1"}`)))
+	rr := httptest.NewRecorder()
+	svc.adminDeleteReplayHandler(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without admin token, got %d", rr.Code)
+	}
+}
+
+func TestAdminDeleteReplayRemovesRecordAndIndexes(t *testing.T) {
+	logger = zap.NewNop()
+	now := time.Now().UTC()
+	svc := &replayService{
+		records: map[string]*replayRecord{
+			replayRecordKey("m-1", "1"): {
+				MatchID:       "m-1",
+				MapID:         "1",
+				State:         replayStateReady,
+				LastUpdatedAt: now,
+				CreatedAt:     now,
+			},
+			replayRecordKey("m-1", "2"): {
+				MatchID:       "m-1",
+				MapID:         "2",
+				State:         replayStateQueued,
+				LastUpdatedAt: now,
+				CreatedAt:     now,
+			},
+			replayRecordKey("m-2", "1"): {
+				MatchID:       "m-2",
+				MapID:         "1",
+				State:         replayStateReady,
+				LastUpdatedAt: now,
+				CreatedAt:     now,
+			},
+		},
+		latestMapByMatch: map[string]string{"m-1": "2", "m-2": "1"},
+		seenEvents: map[string]struct{}{
+			"evt-a::m-1::2": {},
+			"evt-b::m-1::1": {},
+			"evt-c::m-2::1": {},
+		},
+		queueOrder: []string{replayRecordKey("m-1", "2"), replayRecordKey("m-2", "1")},
+		queue:      make(chan replayWork, 10),
+		stateFile:  filepath.Join(t.TempDir(), "replay_state.json"),
+		adminToken: "token",
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/replays/delete", bytes.NewReader([]byte(`{"match_id":"m-1","map_id":"2"}`)))
+	req.Header.Set("X-Admin-Token", "token")
+	rr := httptest.NewRecorder()
+	svc.adminDeleteReplayHandler(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 for admin delete, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	svc.mu.RLock()
+	_, hasDeletedRecord := svc.records[replayRecordKey("m-1", "2")]
+	_, hasRemainingRecord := svc.records[replayRecordKey("m-1", "1")]
+	_, hasDeletedSeen := svc.seenEvents["evt-a::m-1::2"]
+	_, hasOtherSeen := svc.seenEvents["evt-b::m-1::1"]
+	latestMapM1 := svc.latestMapByMatch["m-1"]
+	queueOrder := append([]string(nil), svc.queueOrder...)
+	svc.mu.RUnlock()
+
+	if hasDeletedRecord {
+		t.Fatalf("expected deleted replay record to be removed from state")
+	}
+	if !hasRemainingRecord {
+		t.Fatalf("expected non-target replay record to remain")
+	}
+	if hasDeletedSeen {
+		t.Fatalf("expected seen event key for deleted replay to be removed")
+	}
+	if !hasOtherSeen {
+		t.Fatalf("expected seen event keys for other maps to remain")
+	}
+	if latestMapM1 != "1" {
+		t.Fatalf("expected latest map for m-1 to fall back to map 1, got %s", latestMapM1)
+	}
+	if len(queueOrder) != 1 || queueOrder[0] != replayRecordKey("m-2", "1") {
+		t.Fatalf("expected queue order to remove deleted key, got %#v", queueOrder)
+	}
+
+	data, err := os.ReadFile(svc.stateFile)
+	if err != nil {
+		t.Fatalf("expected persisted replay state file, got read err: %v", err)
+	}
+	if bytes.Contains(data, []byte(`"m-1::2"`)) {
+		t.Fatalf("expected persisted state to exclude deleted replay key")
 	}
 }

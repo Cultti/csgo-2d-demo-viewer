@@ -124,6 +124,41 @@ Admin-only manual reprocess endpoint.
 - `demo_url` (required)
 - `map_id` (optional)
 
+### `POST /admin/replays/reprocess-failed`
+
+Admin-only bulk reprocess endpoint for records currently in `failed` state.
+
+**Headers:**
+- `X-Admin-Token`: Must match `ADMIN_REPROCESS_TOKEN`
+
+**Body (all optional):**
+- `match_id`: Limit to one match
+- `map_id`: Limit to one map id
+- `limit`: Maximum number of failed records to process (`0` = no limit)
+- `dry_run`: If `true`, returns counts without queueing
+
+**Behavior:**
+- Only records in `failed` state are considered.
+- Records without `demo_url` are skipped.
+- Returns queueing summary counters (`failed_scanned`, `failed_matched`, `failed_selected`, `queued`, `queue_full`, `skipped_no_demo_url`).
+
+### `POST /admin/replays/delete`
+
+Admin-only endpoint to remove a replay record from persisted state.
+
+**Headers:**
+- `X-Admin-Token`: Must match `ADMIN_REPROCESS_TOKEN`
+
+**Body:**
+- `match_id` (required)
+- `map_id` (required)
+
+**Behavior:**
+- Removes the replay key `<match_id>::<map_id>` from `records`.
+- Removes matching dedupe keys from `seen_events`.
+- Removes the replay key from `queue_order`.
+- Recomputes `latest_map_by_match` for the match.
+
 ### Static File Serving
 
 All other requests serve static files from the web application build directory.

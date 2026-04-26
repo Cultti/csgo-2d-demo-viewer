@@ -4,8 +4,9 @@ go 1.25.1
 
 require (
 	csgo-2d-demo-player v0.0.0
+	github.com/klauspost/compress v1.18.0
 	go.uber.org/zap v1.27.0
-	google.golang.org/protobuf v1.36.10
+	google.golang.org/protobuf v1.36.11
 )
 
 replace csgo-2d-demo-player => ../parser
@@ -13,8 +14,7 @@ replace csgo-2d-demo-player => ../parser
 require (
 	github.com/golang/geo v0.0.0-20251014162054-f262919d8753 // indirect
 	github.com/golang/snappy v1.0.0 // indirect
-	github.com/klauspost/compress v1.18.0 // indirect
-	github.com/markus-wa/demoinfocs-golang/v5 v5.1.2 // indirect
+	github.com/markus-wa/demoinfocs-golang/v5 v5.2.0 // indirect
 	github.com/markus-wa/go-unassert v0.1.3 // indirect
 	github.com/markus-wa/gobitread v0.2.5-0.20241202000432-3c3e0bc797c6 // indirect
 	github.com/markus-wa/godispatch v1.4.1 // indirect
