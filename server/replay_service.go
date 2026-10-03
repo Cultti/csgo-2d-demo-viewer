@@ -79,6 +79,8 @@ type replayMetadata struct {
 	ArtifactPath      string    `json:"artifact_path"`
 	ArtifactSizeBytes int64     `json:"artifact_size_bytes"`
 	ArtifactKind      string    `json:"artifact_kind"`
+	ChatPath          string    `json:"chat_path,omitempty"`
+	ChatMessageCount  int       `json:"chat_message_count"`
 	SourceDemoURL     string    `json:"source_demo_url"`
 }
 
@@ -792,7 +794,8 @@ func (s *replayService) process(job replayWork) error {
 	reducedSizeBytes := int64(0)
 	var callbackErr error
 
-	parseErr := pparser.WasmParseDemo(parseFilename, tmpFile, func(payload []byte) {
+	chatMessages := make([]pparser.ChatEntry, 0)
+	parseErr := pparser.ParseDemoWithChat(parseFilename, tmpFile, func(payload []byte) {
 		if callbackErr != nil {
 			return
 		}
@@ -818,6 +821,8 @@ func (s *replayService) process(job replayWork) error {
 		}
 		messageCount++
 		reducedSizeBytes += int64(4 + len(payload))
+	}, func(entry pparser.ChatEntry) {
+		chatMessages = append(chatMessages, entry)
 	})
 	if callbackErr != nil {
 		return callbackErr
@@ -838,6 +843,10 @@ func (s *replayService) process(job replayWork) error {
 
 	artifactName := fmt.Sprintf("%s-%s.pbr.gz", job.MatchID, job.MapID)
 	artifactPath := filepath.Join(matchDir, artifactName)
+	chatPath := filepath.Join(matchDir, fmt.Sprintf("%s-%s.chat.json", job.MatchID, job.MapID))
+	if err := writeJSONFileAtomic(chatPath, chatMessages); err != nil {
+		return fmt.Errorf("save chat: %w", err)
+	}
 	if err := os.Rename(replayTmpPath, artifactPath); err != nil {
 		return err
 	}
@@ -852,13 +861,15 @@ func (s *replayService) process(job replayWork) error {
 		MapID:             job.MapID,
 		MatchInstanceID:   job.MatchInstanceID,
 		SchemaVersion:     1,
-		ParserVersion:     "ingest-v2",
+		ParserVersion:     "ingest-v3",
 		SourceEventID:     job.EventID,
 		SourceReceivedAt:  job.Timestamp,
 		CreatedAt:         time.Now().UTC(),
 		ArtifactPath:      artifactPath,
 		ArtifactSizeBytes: artifactInfo.Size(),
 		ArtifactKind:      "proto_replay_stream_gzip_v1",
+		ChatPath:          chatPath,
+		ChatMessageCount:  len(chatMessages),
 		SourceDemoURL:     secureURL,
 	}
 	metaPath := filepath.Join(matchDir, "metadata.json")

@@ -29,6 +29,11 @@ type RoundTimer struct {
 }
 
 func Parse(demoFile io.Reader, handler func(msg *message.Message, state dem.GameState)) error {
+	return ParseWithChat(demoFile, handler, nil)
+}
+
+// ParseWithChat extracts chat alongside playback without parsing the demo twice.
+func ParseWithChat(demoFile io.Reader, handler func(msg *message.Message, state dem.GameState), chatHandler func(ChatEntry)) error {
 	parser := dem.NewParser(demoFile)
 	defer func() {
 		if err := parser.Close(); err != nil {
@@ -36,6 +41,13 @@ func Parse(demoFile io.Reader, handler func(msg *message.Message, state dem.Game
 		}
 	}()
 
+	if chatHandler != nil {
+		parser.RegisterEventHandler(func(e events.SayText2) {
+			if entry, ok := chatEntry(e, parser.GameState().IngameTick(), parser.CurrentTime()); ok {
+				chatHandler(entry)
+			}
+		})
+	}
 	matchErr := parseMatch(parser, handler)
 	if matchErr != nil {
 		return matchErr

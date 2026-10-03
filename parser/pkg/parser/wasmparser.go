@@ -18,6 +18,11 @@ import (
 )
 
 func WasmParseDemo(demoFilename string, demoFile io.Reader, callback func(payload []byte)) (err error) {
+	return ParseDemoWithChat(demoFilename, demoFile, callback, nil)
+}
+
+// ParseDemoWithChat accepts the same compressed formats as WasmParseDemo.
+func ParseDemoWithChat(demoFilename string, demoFile io.Reader, callback func(payload []byte), chatHandler func(ChatEntry)) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic while parsing demo: %v\nstacktrace:\n%s", r, string(debug.Stack()))
@@ -35,7 +40,7 @@ func WasmParseDemo(demoFilename string, demoFile io.Reader, callback func(payloa
 	parseStopwatch := time.Now()
 	msgStopwatch := time.Now()
 	log.L().Debug("starting parsing the demo", zap.String("demo file", demoFilename))
-	parseErr := Parse(decompressedDemo, func(msg *message.Message, state demoinfocs.GameState) {
+	parseErr := ParseWithChat(decompressedDemo, func(msg *message.Message, state demoinfocs.GameState) {
 		log.L().Debug("parsed some part", zap.String("message", msg.MsgType.String()), zap.Duration("took", time.Since(msgStopwatch)))
 
 		payload, protoErr := proto.Marshal(msg)
@@ -44,7 +49,7 @@ func WasmParseDemo(demoFilename string, demoFile io.Reader, callback func(payloa
 		}
 		callback(payload)
 		msgStopwatch = time.Now()
-	})
+	}, chatHandler)
 
 	log.L().Debug("parsing done", zap.String("demo file", demoFilename), zap.Duration("took", time.Since(parseStopwatch)))
 	return parseErr

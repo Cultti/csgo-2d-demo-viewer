@@ -40,6 +40,25 @@ Static assets and the SPA are served by **Firebase Hosting** (`firebase.json`). 
 ### CI/CD (`.github/workflows/`)
 Using GitHub Actions
 
+### Standalone Linux x64 release from Windows
+
+With Go and Node.js/npm installed, run from PowerShell:
+
+```powershell
+.\build-linux-x64.ps1
+```
+
+This performs the same builds as `build-linux-x64.sh` without requiring Make,
+Bash, or WSL. It creates `deploy/linux-x64/` and `deploy/linux-x64.tar.gz`,
+containing the Linux server, frontend, WASM assets, and `run.sh`. The archive
+preserves Linux executable permissions and the launcher uses LF line endings.
+Upload the archive to Linux, extract it, and run `cd linux-x64 && ./run.sh`.
+
+Use `-OutDir deploy/linux-x64-release` to choose a different release folder
+inside this repository's `deploy/` directory. That folder and its `.tar.gz`
+are replaced on each build. The script restores Go environment variables when
+it finishes. Frontend `.env` settings apply as in the Bash build.
+
 ### GitHub Copilot Agents (`.github/agents/`)
 Specialized agents provide expert guidance for different areas of the codebase:
 - **Go Parser Specialist** - WebAssembly parser development

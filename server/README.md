@@ -185,4 +185,13 @@ All other requests serve static files from the web application build directory.
    - Faceit webhook hits `/webhooks/faceit/demo-ready`
    - Server validates static secret header and payload
    - Background worker downloads demo and stores artifact under `parsed/<match_id>/`
+   - New ingestions also save `<match_id>-<map_id>.chat.json` in that directory.
+     This JSON array contains `tick` (in-game tick), `time_seconds` (elapsed demo
+     time), `sender_name` when present, `text`, and the raw `message_type`.
+     Chat is extracted in the same parsing pass, including warmup messages.
+     `metadata.json` records `chat_path` and `chat_message_count`.
+     An empty array means no supported chat messages were found; demos may omit
+     chat, especially team chat. Absolute send times are not inferred.
+     Existing ready replays are not automatically reparsed. Chat files are stored
+     on disk only; the playback endpoint continues to serve the replay artifact.
    - Client can poll `/replays/<match_id>/status` and load `/replays/<match_id>` when ready
